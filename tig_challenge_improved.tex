@@ -1,0 +1,591 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+
+\geometry{a4paper, margin=1in}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.97,0.97,0.97}
+
+\lstdefinestyle{python}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    numbers=left,
+    numbersep=5pt,
+    tabsize=2,
+    language=Python,
+    frame=single,
+    framerule=0.4pt,
+    rulecolor=\color{codegray}
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{\textbf{Optimal Arbitrage of Energy Storage Systems}\\[0.3em]\large A Challenge Proposal for TIG}
+\author{CEL}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+Electricity markets create profit opportunities for storage operators who can buy power when prices are low and sell when prices spike. The core difficulty is uncertainty: real-time prices deviate unpredictably from day-ahead forecasts due to weather, demand shocks, and transmission congestion. This challenge asks solvers to find operational policies that maximize expected profit under these stochastic conditions while respecting physical constraints.
+
+We structure the problem in two levels. Level~1 considers a single battery facing temporal price volatility. Level~2 extends to a portfolio of batteries distributed across a transmission-constrained network, introducing spatial price differences and coupling constraints. Both levels admit a clean mathematical formulation as stochastic optimal control problems, with difficulty parameters that scale computational hardness while preserving verifiability.
+
+\section{Level 1: Single-Asset Temporal Arbitrage}
+
+\subsection{Problem Statement}
+
+A battery operator observes a day-ahead price forecast and must commit to charge/discharge decisions as real-time prices unfold. The real-time price at each step depends on the operator's previous action---a mechanism we introduce to prevent lookahead cheating. The goal is to maximize expected profit over a finite horizon.
+
+\subsection{State Space and Dynamics}
+
+Let $T = \{0, 1, \ldots, H-1\}$ denote discrete time steps of duration $\Delta t$. The battery state is characterized by its state of charge $E_t \in [\underline{E}, \overline{E}]$, measured in MWh. At each step, the operator chooses charging power $c_t \geq 0$ and discharging power $d_t \geq 0$, subject to:
+\begin{align}
+    c_t &\leq \overline{P}^c, \quad d_t \leq \overline{P}^d, \label{eq:power_bounds}\\
+    c_t \cdot d_t &= 0. \label{eq:exclusivity}
+\end{align}
+Constraint \eqref{eq:exclusivity} prevents simultaneous charging and discharging. The state evolves according to:
+\begin{equation}\label{eq:dynamics}
+    E_{t+1} = E_t + \eta^c c_t \Delta t - \frac{d_t \Delta t}{\eta^d},
+\end{equation}
+where $\eta^c, \eta^d \in (0,1]$ are charging and discharging efficiencies. The round-trip efficiency is $\eta = \eta^c \eta^d$.
+
+\subsection{Price Model with Commitment}
+
+The day-ahead price curve $\{\lambda^{\text{DA}}_t\}_{t \in T}$ is known at $t=0$. Real-time prices $\{\lambda^{\text{RT}}_t\}_{t \in T}$ are revealed sequentially, with a crucial property: the distribution of $\lambda^{\text{RT}}_{t+1}$ depends on the action $a_t = (c_t, d_t)$ taken at time $t$.
+
+This dependency prevents solvers from pre-computing optimal responses to all future prices. We implement it via a hash-based commitment scheme.
+
+\begin{definition}[Action-Committed Price Generation]
+Let $\mathcal{H}: \{0,1\}^* \to \{0,1\}^{256}$ be a cryptographic hash. Define the seed sequence recursively:
+\begin{equation}\label{eq:seed}
+    s_{t+1} = \mathcal{H}\bigl(s_t \,\|\, a_t \,\|\, t \,\|\, E_t\bigr),
+\end{equation}
+where $\|$ denotes concatenation. The real-time price is:
+\begin{equation}\label{eq:rt_price}
+    \lambda^{\text{RT}}_{t+1} = \lambda^{\text{DA}}_{t+1} \cdot \bigl(1 + \mu_{t+1} + \sigma \cdot \xi_{t+1}\bigr) + J_{t+1},
+\end{equation}
+where $\xi_{t+1} \sim \mathcal{N}(0,1)$ is drawn from a PRNG seeded by $s_{t+1}$, $\mu_t$ is a deterministic bias, $\sigma > 0$ controls volatility, and $J_t$ is a jump component for tail events.
+\end{definition}
+
+The jump component $J_t$ models scarcity pricing. With probability $\rho$, we set $J_t = \lambda^{\text{DA}}_t \cdot Z$ where $Z \sim \text{Pareto}(\alpha)$ for some tail index $\alpha > 2$; otherwise $J_t = 0$.
+
+\subsection{Objective Function}
+
+The instantaneous profit at time $t$ is:
+\begin{equation}\label{eq:reward}
+    r_t = (d_t - c_t) \cdot \lambda^{\text{RT}}_t \cdot \Delta t - \phi(c_t, d_t),
+\end{equation}
+where $\phi(c,d)$ represents market frictions:
+\begin{equation}
+    \phi(c,d) = \kappa_{\text{tx}}(c + d)\Delta t + \kappa_{\text{deg}} \cdot \text{DoD}(c,d).
+\end{equation}
+Here $\kappa_{\text{tx}}$ is a transaction cost per MWh, $\kappa_{\text{deg}}$ is a degradation cost, and $\text{DoD}$ measures depth of discharge. A common model is $\text{DoD}(c,d) = (d \cdot \Delta t / \overline{E})^\beta$ for some $\beta > 1$.
+
+The operator seeks a policy $\pi: (E_t, \lambda^{\text{DA}}_{t:H-1}, \lambda^{\text{RT}}_t) \mapsto (c_t, d_t)$ that maximizes:
+\begin{equation}\label{eq:objective}
+    \max_\pi \; \mathbb{E}\left[\sum_{t=0}^{H-1} r_t \;\middle|\; E_0, \lambda^{\text{DA}}, s_0\right].
+\end{equation}
+
+\subsection{Bellman Formulation}
+
+Define the value function $V_t(E)$ as the expected profit-to-go from state $E$ at time $t$. Terminal condition: $V_H(E) = 0$. For $t < H$:
+\begin{equation}\label{eq:bellman}
+    V_t(E) = \max_{(c,d) \in \mathcal{A}(E)} \; \mathbb{E}\Bigl[r_t + V_{t+1}\bigl(E + \eta^c c \Delta t - d\Delta t / \eta^d\bigr)\Bigr],
+\end{equation}
+where $\mathcal{A}(E)$ is the set of feasible actions from state $E$:
+\begin{equation}
+    \mathcal{A}(E) = \Bigl\{(c,d) : c,d \geq 0,\; cd = 0,\; c \leq \overline{P}^c,\; d \leq \overline{P}^d,\; E + \eta^c c \Delta t - d\Delta t/\eta^d \in [\underline{E}, \overline{E}]\Bigr\}.
+\end{equation}
+
+The expectation in \eqref{eq:bellman} is over the conditional distribution of $\lambda^{\text{RT}}_t$ given the current information. Due to the commitment mechanism \eqref{eq:seed}, this distribution cannot be sampled without committing to $(c,d)$.
+
+\subsection{Benchmark: Approximate Dynamic Programming}
+
+Stochastic Dual Dynamic Programming (SDDP) approximates $V_t$ by a piecewise-linear lower bound constructed from Benders cuts. We adapt SDDP to our setting by sampling price scenarios in the forward pass and constructing cuts in the backward pass.
+
+\begin{algorithm}[H]
+\caption{SDDP for Single-Asset Arbitrage}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Horizon $H$, sample count $N$, iterations $K$
+\State \textbf{Initialize:} $\mathcal{C}_t \gets \emptyset$ for all $t$ (cut sets)
+\For{$k = 1, \ldots, K$}
+    \For{$n = 1, \ldots, N$} \Comment{Forward pass}
+        \State Sample $s_0^{(n)}$; set $E_0^{(n)} \gets E_0$
+        \For{$t = 0, \ldots, H-1$}
+            \State Solve: $(c_t^*, d_t^*, \theta_t^*) \gets \arg\max\; r_t(c,d) + \theta$
+            \Statex \hspace{4em} s.t. $(c,d) \in \mathcal{A}(E_t^{(n)})$, $\theta \leq \alpha + \beta E_{t+1}$ for all $(\alpha, \beta) \in \mathcal{C}_{t+1}$
+            \State Commit action; generate $\lambda^{\text{RT}}_{t+1}$ via \eqref{eq:seed}--\eqref{eq:rt_price}
+            \State Update $E_{t+1}^{(n)}$ via \eqref{eq:dynamics}
+        \EndFor
+    \EndFor
+    \For{$t = H-1, \ldots, 0$} \Comment{Backward pass}
+        \For{$n = 1, \ldots, N$}
+            \State At state $E_t^{(n)}$, solve the stage problem; extract dual $\mu^{(n)}_t$ on state constraint
+            \State Construct cut: $\mathcal{C}_t \gets \mathcal{C}_t \cup \{(\alpha^{(n)}, \beta^{(n)})\}$
+        \EndFor
+    \EndFor
+\EndFor
+\State \textbf{Return:} Policy defined by cut sets $\{\mathcal{C}_t\}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}
+The commitment mechanism \eqref{eq:seed} means we cannot sample future prices during the forward pass without committing to actions. SDDP therefore operates on a \emph{relaxation}: we sample prices from the unconditional distribution $\lambda^{\text{RT}}_t \sim \lambda^{\text{DA}}_t(1 + \mu_t + \sigma\xi_t) + J_t$ with $\xi_t \sim \mathcal{N}(0,1)$ and $J_t$ from the jump model. The true objective \eqref{eq:objective} uses action-committed prices, so SDDP provides an upper bound. The gap measures the value of lookahead information that the mechanism denies.
+\end{remark}
+
+\subsection{Difficulty Parameters}
+
+Three parameters control problem hardness:
+
+\textbf{Volatility} $\sigma \in [0.1, 0.5]$: Higher values increase the variance of real-time prices around the day-ahead forecast. This widens the distribution of possible outcomes, making robust policies harder to find.
+
+\textbf{Tail index} $\alpha \in (2, 5]$: Smaller values produce heavier tails in the jump distribution, with more frequent extreme spikes. The expected jump size is $\mathbb{E}[Z] = \alpha/(\alpha - 1)$ for $\alpha > 1$, diverging as $\alpha \to 1$.
+
+\textbf{Friction} $\kappa = (\kappa_{\text{tx}}, \kappa_{\text{deg}})$: Higher costs reduce profit margins and penalize excessive cycling. This creates a tradeoff between capturing spreads and preserving battery life.
+
+
+\section{Level 2: Portfolio Arbitrage on a Constrained Network}
+
+\subsection{Problem Statement}
+
+An operator manages $m$ batteries at nodes $\mathcal{N} = \{1, \ldots, n\}$ of a transmission network. Each node $i$ has locational marginal price $\lambda^{\text{RT}}_{i,t}$, which can differ across nodes due to congestion. The operator must coordinate all batteries to maximize portfolio profit while respecting network flow limits.
+
+\subsection{Network Model}
+
+The transmission network is a graph $(\mathcal{N}, \mathcal{L})$ where $\mathcal{L}$ is the set of lines. Under the DC power flow approximation, power flows are linear in nodal injections. Let $p_i \in \mathbb{R}$ denote net injection at node $i$ (positive for generation, negative for load). The flow on line $\ell = (i,j)$ is:
+\begin{equation}
+    f_\ell = \sum_{k \in \mathcal{N}} \text{PTDF}_{\ell k} \cdot p_k,
+\end{equation}
+where $\text{PTDF} \in \mathbb{R}^{|\mathcal{L}| \times n}$ is the Power Transfer Distribution Factor matrix.
+
+\begin{proposition}[PTDF Construction]
+Let $B \in \mathbb{R}^{n \times n}$ be the bus susceptance matrix with $B_{ij} = -b_{ij}$ for $i \neq j$ (where $b_{ij}$ is line susceptance) and $B_{ii} = \sum_{j \neq i} b_{ij}$. Choose a slack bus $s$ and let $\tilde{B}$ be $B$ with row and column $s$ deleted. Define $X = \tilde{B}^{-1}$ (extended with zeros for the slack). Then:
+\begin{equation}
+    \text{PTDF}_{\ell k} = b_\ell (X_{ik} - X_{jk}),
+\end{equation}
+where $\ell = (i,j)$ and $b_\ell$ is the susceptance of line $\ell$.
+\end{proposition}
+
+\subsection{State Space and Constraints}
+
+Each battery $b \in \mathcal{B}$ is located at node $\nu(b) \in \mathcal{N}$ with parameters $(\underline{E}_b, \overline{E}_b, \overline{P}^c_b, \overline{P}^d_b, \eta^c_b, \eta^d_b)$. Let $E_{b,t}$ denote its state of charge and $(c_{b,t}, d_{b,t})$ its charge/discharge powers. The dynamics \eqref{eq:dynamics} apply to each battery independently.
+
+The net injection at node $i$ from storage is:
+\begin{equation}
+    p^{\text{stor}}_{i,t} = \sum_{b : \nu(b) = i} (d_{b,t} - c_{b,t}).
+\end{equation}
+Total net injection includes exogenous generation and load:
+\begin{equation}
+    p_{i,t} = p^{\text{gen}}_{i,t} - p^{\text{load}}_{i,t} + p^{\text{stor}}_{i,t}.
+\end{equation}
+Line flows must satisfy thermal limits:
+\begin{equation}\label{eq:flow_limits}
+    |f_{\ell,t}| = \left|\sum_{k \in \mathcal{N}} \text{PTDF}_{\ell k} \cdot p_{k,t}\right| \leq \overline{F}_\ell \quad \forall \ell \in \mathcal{L}.
+\end{equation}
+
+\subsection{Nodal Price Model}
+
+Locational marginal prices arise from the dual variables of the power balance and flow constraints in the economic dispatch problem. We model them as correlated stochastic processes:
+\begin{equation}\label{eq:lmp}
+    \lambda^{\text{RT}}_{i,t} = \lambda^{\text{DA}}_{i,t} + \sigma_i \xi_{i,t} + \gamma \cdot \mathbf{1}\{\text{line incident to } i \text{ is congested}\} \cdot \zeta_t,
+\end{equation}
+where $\xi_{i,t}$ are node-specific shocks, $\gamma > 0$ is a congestion premium, and $\zeta_t$ is a common factor. The correlation structure reflects that prices at connected nodes tend to move together unless separated by congested lines.
+
+\subsection{Objective}
+
+The portfolio profit at time $t$ is:
+\begin{equation}
+    R_t = \sum_{b \in \mathcal{B}} (d_{b,t} - c_{b,t}) \cdot \lambda^{\text{RT}}_{\nu(b),t} \cdot \Delta t - \sum_{b \in \mathcal{B}} \phi_b(c_{b,t}, d_{b,t}).
+\end{equation}
+The operator maximizes $\mathbb{E}[\sum_t R_t]$ subject to \eqref{eq:flow_limits} and battery constraints.
+
+\subsection{Decomposition Approach}
+
+The coupling constraints \eqref{eq:flow_limits} link all batteries. We apply Benders decomposition by treating battery dispatch as complicating variables.
+
+\textbf{Master problem:} Determines battery schedules $(c_{b,t}, d_{b,t})$ for all $b, t$, using cuts from subproblems.
+
+\textbf{Subproblem (one per scenario $\omega$):} Given battery schedules, checks feasibility of network flows. If feasible, returns optimal dispatch cost; if infeasible, returns a feasibility cut.
+
+\begin{algorithm}[H]
+\caption{Benders Decomposition for Portfolio Arbitrage}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Network $(\mathcal{N}, \mathcal{L})$, batteries $\mathcal{B}$, scenarios $\Omega$
+\State \textbf{Initialize:} $\text{LB} \gets -\infty$, $\text{UB} \gets +\infty$, cut set $\mathcal{C} \gets \emptyset$
+\While{$\text{UB} - \text{LB} > \epsilon$}
+    \State \textbf{Master:} Solve
+    \begin{align*}
+        \max \quad & \sum_{b,t} (d_{b,t} - c_{b,t}) \cdot \bar{\lambda}_{\nu(b),t} \cdot \Delta t + \theta \\
+        \text{s.t.} \quad & \text{battery constraints } \forall b,t \\
+        & \theta \leq g(\mathbf{c}, \mathbf{d}) \quad \forall \text{ cuts in } \mathcal{C}
+    \end{align*}
+    \State Let $(\mathbf{c}^*, \mathbf{d}^*, \theta^*)$ be optimal; update $\text{LB} \gets \text{obj}^*$
+    \For{$\omega \in \Omega$}
+        \State \textbf{Subproblem:} Fix $(\mathbf{c}^*, \mathbf{d}^*)$, solve power flow feasibility
+        \If{infeasible}
+            \State Extract dual ray $\boldsymbol{\mu}^\omega$; add feasibility cut to $\mathcal{C}$
+        \Else
+            \State Compute scenario profit $\Pi^\omega$; extract duals $\boldsymbol{\nu}^\omega$
+            \State Add optimality cut to $\mathcal{C}$
+        \EndIf
+    \EndFor
+    \State Update $\text{UB} \gets \text{LB} + \frac{1}{|\Omega|}\sum_\omega \Pi^\omega - \theta^*$
+\EndWhile
+\State \textbf{Return:} Optimal schedules $(\mathbf{c}^*, \mathbf{d}^*)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Difficulty Parameters}
+
+\textbf{Network size} $n = |\mathcal{N}|$: More nodes increase the state dimension and the number of coupling constraints.
+
+\textbf{Congestion factor} $\gamma_{\text{cong}} \in (0,1]$: Scales line limits as $\overline{F}_\ell \gets \gamma_{\text{cong}} \cdot \overline{F}^{\text{nom}}_\ell$. Lower values create more binding constraints and larger price separations.
+
+\textbf{Portfolio heterogeneity} $h \in [0,1]$: Controls dispersion of battery parameters. With $h = 0$, all batteries are identical; with $h = 1$, parameters vary by a factor of 3.
+
+
+\section{Verification Protocol}
+
+A solution to Level 1 is a transcript $\tau = \{(t, a_t, E_t, s_t, \lambda^{\text{RT}}_t, r_t)\}_{t=0}^{H-1}$. Verification proceeds as:
+
+\begin{enumerate}
+    \item Check $s_0$ matches the instance specification.
+    \item For each $t$: recompute $s_{t+1}$ via \eqref{eq:seed}, regenerate $\lambda^{\text{RT}}_{t+1}$ via \eqref{eq:rt_price}, verify against transcript.
+    \item Check all constraints \eqref{eq:power_bounds}--\eqref{eq:dynamics} are satisfied.
+    \item Recompute $r_t$ via \eqref{eq:reward}; sum to get total profit.
+\end{enumerate}
+
+This takes $O(H)$ time, making verification efficient. The hash commitment ensures that any modification to the action sequence invalidates subsequent prices.
+
+For Level 2, verification additionally checks flow constraints \eqref{eq:flow_limits} at each step, which requires $O(|\mathcal{L}| \cdot n)$ operations per step.
+
+
+\section{Instance Generation}
+
+\subsection{Day-Ahead Price Curve}
+
+We model day-ahead prices as a Gaussian process with a periodic kernel to capture diurnal patterns:
+\begin{equation}
+    k(t, t') = \sigma^2_p \exp\left(-\frac{2\sin^2(\pi|t-t'|/24)}{\ell^2_p}\right) + \sigma^2_{\text{SE}} \exp\left(-\frac{(t-t')^2}{2\ell^2_{\text{SE}}}\right).
+\end{equation}
+The first term captures 24-hour periodicity; the second allows smooth deviations. Sampling $\lambda^{\text{DA}} \sim \mathcal{GP}(\mu, k)$ with mean function $\mu(t) = \bar{\lambda}(1 + 0.3\sin(2\pi t / 24))$ produces realistic price curves.
+
+\subsection{Reference Implementation}
+
+\begin{lstlisting}[style=python, caption=Level 1 Instance Generator]
+import numpy as np
+from dataclasses import dataclass
+from hashlib import sha256
+
+@dataclass
+class Battery:
+    capacity: float  # MWh
+    power: float     # MW
+    efficiency: float
+    soc_min: float = 0.1
+    soc_max: float = 0.9
+
+@dataclass  
+class MarketParams:
+    volatility: float = 0.2
+    tail_prob: float = 0.05
+    tail_index: float = 3.0
+    tx_cost: float = 0.5
+    deg_cost: float = 1.0
+
+def gp_sample(T: int, seed: int) -> np.ndarray:
+    """Sample day-ahead prices from GP with periodic kernel."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(T)
+    
+    # Kernel parameters
+    sigma_p, ell_p = 15.0, 4.0
+    sigma_se, ell_se = 5.0, 6.0
+    
+    # Build covariance matrix
+    dt = t[:, None] - t[None, :]
+    K = (sigma_p**2 * np.exp(-2 * np.sin(np.pi * np.abs(dt) / 24)**2 / ell_p**2)
+         + sigma_se**2 * np.exp(-dt**2 / (2 * ell_se**2)))
+    K += 1e-6 * np.eye(T)
+    
+    # Mean function: base load + diurnal pattern
+    mu = 50 + 20 * np.sin(2 * np.pi * t / 24 - np.pi/2)
+    
+    L = np.linalg.cholesky(K)
+    return mu + L @ rng.standard_normal(T)
+
+class Environment:
+    def __init__(self, battery: Battery, params: MarketParams, 
+                 da_prices: np.ndarray, seed: int):
+        self.bat = battery
+        self.params = params
+        self.da = np.maximum(da_prices, 5.0)  # floor at $5/MWh
+        self.T = len(da_prices)
+        self.seed = seed.to_bytes(8, 'big')
+        self.reset()
+    
+    def reset(self):
+        self.t = 0
+        self.soc = self.bat.capacity * 0.5
+        self.state = self.seed
+        self.rt_price = self._generate_rt(self.da[0])
+        return self._obs()
+    
+    def _generate_rt(self, da: float) -> float:
+        """Generate RT price from committed state."""
+        rng = np.random.default_rng(int.from_bytes(self.state[:8], 'big'))
+        noise = self.params.volatility * rng.standard_normal()
+        
+        # Jump component
+        jump = 0.0
+        if rng.random() < self.params.tail_prob:
+            jump = da * (rng.pareto(self.params.tail_index) + 1)
+        
+        return max(0.0, da * (1 + noise) + jump)
+    
+    def step(self, charge: float, discharge: float) -> tuple:
+        """Execute action, return (obs, reward, done, info)."""
+        # Enforce constraints
+        charge = np.clip(charge, 0, self.bat.power)
+        discharge = np.clip(discharge, 0, self.bat.power)
+        if charge > 0 and discharge > 0:
+            discharge = 0  # prioritize charging
+        
+        # Check SOC feasibility
+        new_soc = (self.soc + self.bat.efficiency * charge 
+                   - discharge / self.bat.efficiency)
+        new_soc = np.clip(new_soc, 
+                          self.bat.soc_min * self.bat.capacity,
+                          self.bat.soc_max * self.bat.capacity)
+        
+        # Compute reward
+        profit = (discharge - charge) * self.rt_price
+        friction = (self.params.tx_cost * (charge + discharge) 
+                    + self.params.deg_cost * (discharge / self.bat.capacity)**2)
+        reward = profit - friction
+        
+        # Commit action to state
+        action_bytes = np.array([charge, discharge]).tobytes()
+        self.state = sha256(self.state + action_bytes 
+                           + self.t.to_bytes(4, 'big')).digest()
+        
+        # Advance
+        self.soc = new_soc
+        self.t += 1
+        done = self.t >= self.T
+        
+        if not done:
+            self.rt_price = self._generate_rt(self.da[self.t])
+        
+        return self._obs(), reward, done, {'soc': self.soc}
+    
+    def _obs(self):
+        return {
+            'soc': self.soc,
+            'da_price': self.da[self.t] if self.t < self.T else 0,
+            'rt_price': self.rt_price,
+            'time': self.t
+        }
+\end{lstlisting}
+
+\begin{lstlisting}[style=python, caption=Level 2 Network and Portfolio]
+import numpy as np
+from scipy.optimize import linprog
+
+def build_ring_network(n: int, susceptance: float = 10.0) -> dict:
+    """Construct n-node ring network with PTDF matrix."""
+    # Incidence matrix: n lines for ring
+    A = np.zeros((n, n))
+    for i in range(n):
+        j = (i + 1) % n
+        A[i, i] = 1
+        A[i, j] = -1
+    
+    # Bus susceptance matrix
+    B = np.zeros((n, n))
+    for i in range(n):
+        j = (i + 1) % n
+        B[i, i] += susceptance
+        B[j, j] += susceptance
+        B[i, j] -= susceptance
+        B[j, i] -= susceptance
+    
+    # Remove slack (node 0)
+    B_red = B[1:, 1:]
+    X = np.zeros((n, n))
+    X[1:, 1:] = np.linalg.inv(B_red)
+    
+    # PTDF: flow on line i for injection at node k
+    PTDF = np.zeros((n, n))
+    for i in range(n):
+        j = (i + 1) % n
+        PTDF[i, :] = susceptance * (X[i, :] - X[j, :])
+    
+    return {'n_nodes': n, 'n_lines': n, 'PTDF': PTDF, 'susceptance': susceptance}
+
+def solve_portfolio_lp(network: dict, batteries: list, 
+                       prices: np.ndarray, line_limits: np.ndarray,
+                       T: int) -> dict:
+    """
+    Solve deterministic portfolio arbitrage via LP.
+    
+    batteries: list of dicts with keys 'node', 'capacity', 'power', 'efficiency'
+    prices: shape (n_nodes, T)
+    line_limits: shape (n_lines,)
+    """
+    n_bat = len(batteries)
+    PTDF = network['PTDF']
+    
+    # Variables: [c_{b,t}, d_{b,t}] for b in batteries, t in T
+    # Order: c_0_0, d_0_0, c_0_1, d_0_1, ..., c_B_T, d_B_T
+    n_vars = 2 * n_bat * T
+    
+    # Objective: maximize sum of (d - c) * price
+    c_obj = np.zeros(n_vars)
+    for b_idx, bat in enumerate(batteries):
+        node = bat['node']
+        for t in range(T):
+            idx_c = 2 * (b_idx * T + t)
+            idx_d = idx_c + 1
+            c_obj[idx_c] = prices[node, t]   # cost of charging
+            c_obj[idx_d] = -prices[node, t]  # revenue from discharge
+    
+    # Inequality constraints: A_ub @ x <= b_ub
+    A_ub_list, b_ub_list = [], []
+    
+    # Line flow limits: |sum_k PTDF_{l,k} * p_k| <= F_l
+    # p_k = sum_{b at node k} (d_b - c_b)
+    for t in range(T):
+        for l in range(network['n_lines']):
+            row_pos = np.zeros(n_vars)
+            row_neg = np.zeros(n_vars)
+            for b_idx, bat in enumerate(batteries):
+                node = bat['node']
+                idx_c = 2 * (b_idx * T + t)
+                idx_d = idx_c + 1
+                row_pos[idx_c] = -PTDF[l, node]
+                row_pos[idx_d] = PTDF[l, node]
+                row_neg[idx_c] = PTDF[l, node]
+                row_neg[idx_d] = -PTDF[l, node]
+            A_ub_list.extend([row_pos, row_neg])
+            b_ub_list.extend([line_limits[l], line_limits[l]])
+    
+    # SOC constraints via cumulative sums
+    for b_idx, bat in enumerate(batteries):
+        eff = bat['efficiency']
+        cap = bat['capacity']
+        soc_init = cap * 0.5
+        
+        for t in range(T):
+            # SOC_t = soc_init + sum_{s<=t} (eff*c_s - d_s/eff)
+            # Require soc_min*cap <= SOC_t <= soc_max*cap
+            row_upper = np.zeros(n_vars)
+            row_lower = np.zeros(n_vars)
+            for s in range(t + 1):
+                idx_c = 2 * (b_idx * T + s)
+                idx_d = idx_c + 1
+                row_upper[idx_c] = eff
+                row_upper[idx_d] = -1/eff
+                row_lower[idx_c] = -eff
+                row_lower[idx_d] = 1/eff
+            
+            A_ub_list.append(row_upper)
+            b_ub_list.append(0.9 * cap - soc_init)
+            A_ub_list.append(row_lower)
+            b_ub_list.append(soc_init - 0.1 * cap)
+    
+    A_ub = np.array(A_ub_list)
+    b_ub = np.array(b_ub_list)
+    
+    # Bounds: 0 <= c, d <= power
+    bounds = []
+    for b_idx, bat in enumerate(batteries):
+        for t in range(T):
+            bounds.append((0, bat['power']))  # charge
+            bounds.append((0, bat['power']))  # discharge
+    
+    result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if result.success:
+        x = result.x
+        schedule = {}
+        for b_idx, bat in enumerate(batteries):
+            schedule[b_idx] = {
+                'charge': [x[2*(b_idx*T + t)] for t in range(T)],
+                'discharge': [x[2*(b_idx*T + t) + 1] for t in range(T)]
+            }
+        return {'success': True, 'profit': -result.fun, 'schedule': schedule}
+    else:
+        return {'success': False, 'message': result.message}
+\end{lstlisting}
+
+
+\section{Conclusion}
+
+This challenge formulates energy storage arbitrage as a stochastic optimal control problem with three distinguishing features. First, the action-committed price generation mechanism ensures computational asymmetry: solving is hard, verification is easy, and lookahead exploitation is impossible. Second, the two-level structure provides a progression from single-asset temporal arbitrage to portfolio coordination under network constraints. Third, the difficulty parameters allow precise scaling of problem hardness while maintaining the core structure.
+
+The combination of realistic market dynamics, physical constraints, and cryptographic commitment makes this a suitable challenge for TIG's proof-of-work framework.
+
+
+\appendix
+\section{Notation Reference}
+
+\begin{longtable}{@{}ll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Description} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol} & \textbf{Description} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+$T, H$ & Time horizon (set and length) \\
+$\Delta t$ & Time step duration \\
+$E_t$ & State of charge at time $t$ (MWh) \\
+$\underline{E}, \overline{E}$ & SOC bounds \\
+$c_t, d_t$ & Charge/discharge power (MW) \\
+$\overline{P}^c, \overline{P}^d$ & Power limits \\
+$\eta^c, \eta^d$ & Charging/discharging efficiency \\
+$\lambda^{\text{DA}}_t$ & Day-ahead price (\$/MWh) \\
+$\lambda^{\text{RT}}_t$ & Real-time price \\
+$s_t$ & Commitment seed at time $t$ \\
+$\sigma$ & Price volatility \\
+$\rho, \alpha$ & Jump probability and tail index \\
+$\phi(\cdot)$ & Friction cost function \\
+$V_t(E)$ & Value function \\
+$\mathcal{N}, \mathcal{L}$ & Nodes and lines of network \\
+$\mathcal{B}$ & Set of batteries \\
+$\nu(b)$ & Node location of battery $b$ \\
+$\text{PTDF}$ & Power transfer distribution factors \\
+$f_\ell$ & Flow on line $\ell$ \\
+$\overline{F}_\ell$ & Line flow limit \\
+\end{longtable}
+
+\end{document}
