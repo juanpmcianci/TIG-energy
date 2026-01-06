@@ -1,0 +1,293 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{parskip}
+\geometry{a4paper, margin=1in}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\title{\textbf{Optimal Arbitrage of Networked Energy Storage}\\[0.35em]
+\large{Challenge Specification for TIG}}
+\author{The CEL Team}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document specifies a single challenge level for TIG: optimal dispatch of a portfolio of batteries located on a transmission-constrained network. The solver must choose charge/discharge actions over a finite horizon to maximize realized profit at real-time nodal prices while respecting battery physics and DC power flow line limits. To ensure ``hard-to-solve, easy-to-verify'' structure and to prevent lookahead exploitation, the real-time price process is generated sequentially from a cryptographic commitment that depends on the solver's past actions. The instance generator exposes tunable difficulty parameters (network scale, congestion tightness, portfolio heterogeneity, volatility, and tail risk), and TIG runs five tracks with fixed parameter regimes.
+\end{abstract}
+
+\section{Introduction}
+Storage arbitrage in electricity markets is fundamentally a spatiotemporal control problem. Temporal opportunity arises from intraday price volatility; spatial opportunity arises because nodal prices diverge when the transmission network becomes congested. A portfolio operator can profit by coordinating batteries across locations and time, but the optimization is complicated by coupling constraints (line limits) and by uncertainty in real-time prices.
+
+The present challenge isolates the computational core in a form suitable for TIG. The solver is given an instance consisting of a transmission network, exogenous nodal injections, a day-ahead price forecast surface, and a portfolio of batteries placed at nodes. The solver must output a battery dispatch schedule. Profit is evaluated at real-time nodal prices that are revealed sequentially. To remove trivial strategies based on precomputing the entire future price path, the distribution of future real-time prices is made dependent on the solver's committed past actions via a hash-based mechanism. Verification recomputes prices, states, flows, and profit deterministically in time linear in the horizon and near-linear in network size.
+
+\section{Problem overview and timing}
+Time is discretized into $H$ steps of duration $\Delta t$ hours, indexed by $t\in\{0,1,\dots,H-1\}$. The solver knows the full instance at $t=0$, including the day-ahead price surface and all exogenous injections for the full horizon. The solver also receives the initial real-time nodal price vector $\lambda^{\mathrm{RT}}_{\cdot,0}$, generated deterministically from the instance seed. At each step $t$, the solver selects battery actions $u_{\cdot,t}$ after observing the current state of charge and the current real-time nodal prices. After the action is committed, the environment updates battery states, checks feasibility of line flows, updates the commitment seed, and generates $\lambda^{\mathrm{RT}}_{\cdot,t+1}$. Consequently, $\lambda^{\mathrm{RT}}_{\cdot,t+1}$ is not knowable at time $t$ without committing to $u_{\cdot,t}$.
+
+\section{Mathematical specification}
+
+\subsection{Sets, indices, and instance data}
+Let $\mathcal{N}=\{1,\dots,n\}$ be the set of nodes, $\mathcal{L}=\{1,\dots,L\}$ the set of transmission lines, and $\mathcal{B}=\{1,\dots,m\}$ the set of batteries. Each battery $b$ is located at node $\nu(b)\in\mathcal{N}$. The instance provides (i) a PTDF matrix $\mathrm{PTDF}\in\mathbb{R}^{L\times n}$ associated with a designated slack bus $s\in\mathcal{N}$, (ii) nominal line limits $\overline{F}^{\mathrm{nom}}_\ell$ and a congestion scaling factor $\gamma_{\mathrm{cong}}$ defining effective limits $\overline{F}_\ell:=\gamma_{\mathrm{cong}}\overline{F}^{\mathrm{nom}}_\ell$, (iii) exogenous nodal injections $p^{\mathrm{exo}}_{i,t}$ (generation minus load) for all $i,t$, (iv) a day-ahead nodal price forecast $\lambda^{\mathrm{DA}}_{i,t}$ for all $i,t$, (v) battery parameters, initial states of charge, and (vi) an initial commitment seed $s_0\in\{0,1\}^{256}$.
+
+\subsection{Battery actions, derived charge/discharge, and SOC dynamics}
+To make the action space unambiguous and to avoid explicit charge/discharge complementarity constraints, the solver controls each battery with a signed power decision
+\[
+u_{b,t}\in[-\overline{P}^c_b,\overline{P}^d_b],
+\]
+where $u_{b,t}>0$ corresponds to discharge (net injection) and $u_{b,t}<0$ corresponds to charge (net withdrawal). We define the induced nonnegative charge and discharge powers by
+\[
+c_{b,t}:=(-u_{b,t})_+,\qquad d_{b,t}:=(u_{b,t})_+,
+\]
+where $(x)_+:=\max\{x,0\}$. Let $E_{b,t}$ denote the state of charge (MWh). SOC evolves as
+\begin{equation}\label{eq:soc}
+E_{b,t+1}=E_{b,t}+\eta^c_b\,c_{b,t}\,\Delta t-\frac{d_{b,t}\,\Delta t}{\eta^d_b},
+\end{equation}
+and must satisfy bounds $\underline{E}_b\le E_{b,t}\le \overline{E}_b$ for all $t$. (Default fractional bounds and initial SOC are fixed in Appendix~\ref{app:constants}, unless overridden.)
+
+\subsection{Nodal injections, slack balancing, and DC line flows}
+Storage injection at node $i$ is the sum of signed battery powers located at $i$:
+\[
+p^{\mathrm{stor}}_{i,t}=\sum_{b:\nu(b)=i} u_{b,t}.
+\]
+Total injection is
+\[
+p_{i,t}=p^{\mathrm{exo}}_{i,t}+p^{\mathrm{stor}}_{i,t}.
+\]
+To enforce power balance in a verifier-friendly way, the slack bus injection is defined endogenously each period by
+\[
+p_{s,t}:=-\sum_{i\in\mathcal{N}\setminus\{s\}} p_{i,t},
+\]
+and $p_{i,t}$ for $i\ne s$ is as above. Given $p_{\cdot,t}$, line flows are computed using the PTDF mapping
+\begin{equation}\label{eq:flows}
+f_{\ell,t}=\sum_{k\in\mathcal{N}} \mathrm{PTDF}_{\ell k}\,p_{k,t}.
+\end{equation}
+Thermal limits must hold at all times:
+\begin{equation}\label{eq:limits}
+|f_{\ell,t}|\le \overline{F}_\ell\qquad \forall \ell\in\mathcal{L},\ \forall t.
+\end{equation}
+
+\subsection{Action-committed real-time price generation}
+Real-time nodal prices are generated sequentially via a commitment scheme that depends on the solver's past actions and states. This is the mechanism that prevents precomputing a future price path without committing to actions.
+
+\paragraph{Quantization for hashing.}
+Submitted actions and SOC values are quantized to fixed-point integers before hashing:
+\[
+\tilde{u}_{b,t}=\mathrm{round}\!\left(\frac{u_{b,t}}{q_u}\right)\in\mathbb{Z},
+\qquad
+\tilde{E}_{b,t}=\mathrm{round}\!\left(\frac{E_{b,t}}{q_E}\right)\in\mathbb{Z},
+\]
+with default quantization steps $q_u$ and $q_E$ specified in Appendix~\ref{app:constants}. The verifier uses the quantized integers in the commitment function irrespective of how the solver computes internally.
+
+\paragraph{Seed update.}
+Let $\mathcal{H}$ be SHA-256. The seed evolves by
+\begin{equation}\label{eq:seed}
+s_{t+1}=\mathcal{H}\Bigl(s_t \,\|\, t \,\|\, (\tilde{u}_{1,t},\dots,\tilde{u}_{m,t}) \,\|\, (\tilde{E}_{1,t},\dots,\tilde{E}_{m,t})\Bigr),
+\end{equation}
+where concatenation uses a canonical byte encoding: big-endian signed 64-bit integers in the natural order of indices (Appendix~\ref{app:constants}). This makes the commitment deterministic and language-agnostic.
+
+\paragraph{Deterministic PRNG from seed.}
+All pseudo-random draws at time $t$ are derived from $s_t$ using hash-in-counter-mode. For integer counter $j\ge 0$, define
+\[
+W_j=\mathcal{H}(s_t\,\|\,j),
+\qquad
+U_j=\frac{\mathrm{uint64}(W_j)}{2^{64}}\in[0,1),
+\]
+where $\mathrm{uint64}(\cdot)$ takes the first eight bytes of $W_j$ as an unsigned 64-bit integer. Standard normals are generated deterministically from the $U_j$ stream using Box--Muller (or an equivalent transform fixed in the reference implementation).
+
+\paragraph{Spatially correlated shocks.}
+At each time $t$, define a common factor $z_t\sim\mathcal{N}(0,1)$ and i.i.d.\ idiosyncratic node shocks $\varepsilon_{i,t}\sim\mathcal{N}(0,1)$. With spatial correlation parameter $\rho_{\mathrm{sp}}\in[0,1]$, set
+\[
+\xi_{i,t}=\sqrt{\rho_{\mathrm{sp}}}\,z_t+\sqrt{1-\rho_{\mathrm{sp}}}\,\varepsilon_{i,t}.
+\]
+
+\paragraph{Endogenous congestion indicator (lagged to avoid circularity).}
+Prices at time $t$ include a congestion premium based on whether congestion occurred at the previous dispatch. Define $\mathbf{1}^{\mathrm{cong}}_{i,0}:=0$. For $t\ge 0$, define $\mathbf{1}^{\mathrm{cong}}_{i,t+1}$ from flows at time $t$ by
+\[
+\mathbf{1}^{\mathrm{cong}}_{i,t+1}
+=
+\mathbf{1}\Bigl\{\exists \ell \text{ incident to node } i:\ |f_{\ell,t}|\ge \tau_{\mathrm{cong}}\overline{F}_\ell\Bigr\},
+\]
+where $\tau_{\mathrm{cong}}\in(0,1)$ is a fixed proximity threshold. This construction ensures that the price used to settle action $u_{\cdot,t}$ is known before choosing $u_{\cdot,t}$, while the next-step price depends on the committed action through the induced flows.
+
+\paragraph{Jump (scarcity) component.}
+Independently for each node-time pair, with probability $\rho_{\mathrm{jump}}$ draw $Z\sim\mathrm{Pareto}(\alpha)$ (support $[1,\infty)$) and set $J_{i,t}:=\lambda^{\mathrm{DA}}_{i,t}\cdot Z$; otherwise set $J_{i,t}:=0$. Here $\alpha>2$ controls tail heaviness.
+
+\paragraph{Real-time nodal price.}
+Let $\zeta_t:=\max\{0,z'_t\}$ where $z'_t\sim\mathcal{N}(0,1)$ is an additional factor draw from the same PRNG stream. The real-time LMP is defined by
+\begin{equation}\label{eq:lmp}
+\lambda^{\mathrm{RT}}_{i,t}
+=
+\mathrm{clip}\Bigl(
+\lambda^{\mathrm{DA}}_{i,t}\cdot\bigl(1+\mu+\sigma\,\xi_{i,t}\bigr)
++
+\gamma_{\mathrm{price}}\cdot \mathbf{1}^{\mathrm{cong}}_{i,t}\cdot \zeta_t
++
+J_{i,t},
+\ \lambda_{\min},\ \lambda_{\max}
+\Bigr),
+\end{equation}
+where $\mu$ is a deterministic bias, $\sigma>0$ is volatility, $\gamma_{\mathrm{price}}>0$ is the congestion premium scale, and $\mathrm{clip}(x,a,b)=\min\{\max\{x,a\},b\}$. Default values and track overrides are given in Appendix~\ref{app:constants} and Appendix~\ref{app:tracks}.
+
+\begin{remark}
+The commitment enters through $s_{t+1}$ in \eqref{eq:seed}. Since $s_{t+1}$ depends on the entire action vector $u_{\cdot,t}$ (quantized), the joint law of future prices depends on the solver's committed actions. This eliminates offline enumeration of future prices without committing to a specific trajectory, while keeping verification a deterministic replay.
+\end{remark}
+
+\subsection{Profit, frictions, and objective}
+Settlements use the nodal real-time price at the battery's node. The per-period portfolio profit is
+\begin{equation}\label{eq:reward}
+R_t=\sum_{b\in\mathcal{B}} u_{b,t}\,\lambda^{\mathrm{RT}}_{\nu(b),t}\,\Delta t - \sum_{b\in\mathcal{B}} \phi_b(u_{b,t}),
+\end{equation}
+where frictions are modeled as
+\begin{equation}\label{eq:friction}
+\phi_b(u)=\kappa_{\mathrm{tx},b}\,|u|\,\Delta t + \kappa_{\mathrm{deg},b}\left(\frac{|u|\Delta t}{\overline{E}_b}\right)^{\beta_b}.
+\end{equation}
+The TIG score for an instance is the total realized profit $\sum_{t=0}^{H-1}R_t$ provided all constraints are satisfied. If any constraint in \eqref{eq:soc} or \eqref{eq:limits} is violated at any time (beyond numerical tolerances specified in Appendix~\ref{app:constants}), the submission is invalid for that instance.
+
+\section{Difficulty parameters and TIG track design}
+The challenge has two distinct sources of hardness: coupled feasibility under network constraints, and sequential decision-making under action-committed stochastic prices. Network coupling is primarily controlled by $(n,L)$ and the tightness scaling $\gamma_{\mathrm{cong}}$; portfolio complexity is controlled by $m$ and heterogeneity $h$ (dispersion of battery parameters); uncertainty is controlled by volatility $\sigma$ and jump tail parameters $(\rho_{\mathrm{jump}},\alpha)$. TIG runs five tracks, each fixing a parameter regime. Tracks are chosen to form a monotone ladder in computational burden and to induce qualitatively different algorithmic regimes: early tracks are correctness-oriented and only mildly congested, while later tracks feature frequent congestion, heavier tails, longer horizons, and materially heterogeneous fleets, forcing solvers to balance feasibility management, risk control, and spatiotemporal coordination.
+
+\section{Verification protocol}
+A verifier is given the full instance data, the initial seed $s_0$, and the submitted action array $\{u_{b,t}\}$. Verification proceeds deterministically as follows. At $t=0$, the verifier initializes SOCs at the specified $E_{b,0}$ and computes $\lambda^{\mathrm{RT}}_{\cdot,0}$ from $s_0$ using \eqref{eq:lmp} with $\mathbf{1}^{\mathrm{cong}}_{\cdot,0}=0$. For each $t=0,1,\dots,H-1$, it (i) quantizes $u_{b,t}$ and $E_{b,t}$, (ii) updates SOCs via \eqref{eq:soc} and checks SOC bounds, (iii) computes $p_{\cdot,t}$ including slack balancing and then flows $f_{\cdot,t}$ via \eqref{eq:flows}, checking \eqref{eq:limits}, (iv) computes the period profit $R_t$ via \eqref{eq:reward}--\eqref{eq:friction}, (v) forms $\mathbf{1}^{\mathrm{cong}}_{\cdot,t+1}$ from $f_{\cdot,t}$, (vi) updates $s_{t+1}$ via \eqref{eq:seed}, and (vii) generates $\lambda^{\mathrm{RT}}_{\cdot,t+1}$ via \eqref{eq:lmp}. The reported score is the sum of verified profits. Computational cost is $O\!\left(H\cdot(Ln+m)\right)$ operations with small constants; no optimization is performed during verification.
+
+\section{Instance generation (reference design)}
+Instances are generated from a single master seed and track parameters. The generator produces a connected network graph with $(n,L)$ and assigns line susceptances; it then constructs the PTDF matrix for a chosen slack bus. Exogenous injections $p^{\mathrm{exo}}_{i,t}$ are sampled as a low-rank spatiotemporal process (for example, two time factors times two node loading patterns plus small noise), then rebalanced at the slack bus, and finally rescaled if necessary so that, under zero storage actions, flows satisfy $|f_{\ell,t}|\le \overline{F}^{\mathrm{nom}}_\ell$ for all $\ell,t$. This feasibility guarantee ensures that each instance admits at least one valid submission.
+
+Day-ahead prices are generated as a smooth diurnal baseline plus node offsets and a correlated residual. Concretely, the generator sets a baseline $\bar{\lambda}_t=\lambda_0+A\sin(2\pi t\Delta t/24-\pi/2)$, draws node offsets $\delta_i$, and adds a small stationary AR(1) residual $\eta_{i,t}$; it then sets $\lambda^{\mathrm{DA}}_{i,t}=\max\{\lambda_{\mathrm{DA,min}},\bar{\lambda}_t+\delta_i+\eta_{i,t}\}$. Batteries are placed uniformly at random across nodes (allowing multiple batteries per node). Nominal battery parameters are assigned and then perturbed by a heterogeneity mechanism controlled by $h$ (Appendix~\ref{app:tracks}); friction parameters are set to track defaults unless explicitly varied.
+
+\appendix
+
+\section{Default constants (initial values for testing)}\label{app:constants}
+The following constants are used unless overridden by the track definition. These are intended as starting values for pilot runs and can be adjusted after testing.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} & \textbf{Default value} \\
+\midrule
+$\Delta t$ & time step duration & $0.25$ h (15 minutes) \\
+$s$ & slack bus index & $1$ \\
+$q_u$ & action quantization step & $0.01$ MW \\
+$q_E$ & SOC quantization step & $0.01$ MWh \\
+$e_{\min},e_{\max}$ & fractional SOC bounds & $e_{\min}=0.10,\ e_{\max}=0.90$ \\
+$E_{b,0}$ & initial SOC & $0.50\,\overline{E}_b$ \\
+$\eta^c_b,\eta^d_b$ & charge/discharge efficiency & $0.95,\ 0.95$ \\
+$\kappa_{\mathrm{tx},b}$ & transaction cost & \$0.25/MWh \\
+$\kappa_{\mathrm{deg},b}$ & degradation scale & \$1.00 \\
+$\beta_b$ & degradation exponent & $2$ \\
+$\mu$ & RT bias term & $0$ \\
+$\rho_{\mathrm{sp}}$ & spatial correlation & $0.70$ \\
+$\gamma_{\mathrm{price}}$ & congestion premium scale & \$20/MWh \\
+$\tau_{\mathrm{cong}}$ & congestion proximity threshold & $0.97$ \\
+$\rho_{\mathrm{jump}}$ & jump probability & $0.02$ \\
+$\alpha$ & Pareto tail index & $3.5$ \\
+$\lambda_{\min}$ & RT price floor & \$-200/MWh \\
+$\lambda_{\max}$ & RT price cap & \$5000/MWh \\
+$\lambda_{\mathrm{DA,min}}$ & DA price floor & \$0/MWh \\
+$\varepsilon_{\mathrm{flow}}$ & flow feasibility tolerance & $10^{-6}$ (per-unit of $\overline{F}_\ell$) \\
+$\varepsilon_{\mathrm{soc}}$ & SOC feasibility tolerance & $10^{-9}$ MWh \\
+$\mathcal{H}$ & hash function & SHA-256 \\
+\bottomrule
+\end{tabular}
+\caption{Default constants for Level 2 (initial test settings).}
+\end{table}
+
+\paragraph{Canonical encoding.}
+All integers in the hash input to \eqref{eq:seed} are encoded as big-endian signed 64-bit two's-complement. The concatenation order is exactly $(s_t)$, then $(t)$, then $(\tilde{u}_{1,t},\dots,\tilde{u}_{m,t})$, then $(\tilde{E}_{1,t},\dots,\tilde{E}_{m,t})$.
+
+\section{TIG tracks: five parameter regimes and rationale}\label{app:tracks}
+Each track fixes $(n,L,m,H)$ and the key difficulty knobs $(\gamma_{\mathrm{cong}},\sigma,\rho_{\mathrm{jump}},\alpha,h)$. Instances within a track vary by the master seed, which drives network realization, day-ahead prices, and exogenous injections.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lllllllllll@{}}
+\toprule
+\textbf{Track} &
+$n$ &
+$L$ &
+$m$ &
+$H$ &
+$\gamma_{\mathrm{cong}}$ &
+$\sigma$ &
+$\rho_{\mathrm{jump}}$ &
+$\alpha$ &
+$h$ \\
+\midrule
+1 & 20  & 30  & 10  & 96  & 1.00 & 0.10 & 0.01 & 4.0 & 0.2 \\
+2 & 40  & 60  & 20  & 96  & 0.80 & 0.15 & 0.02 & 3.5 & 0.4 \\
+3 & 80  & 120 & 40  & 192 & 0.60 & 0.20 & 0.03 & 3.0 & 0.6 \\
+4 & 100 & 200 & 60  & 192 & 0.50 & 0.25 & 0.04 & 2.7 & 0.8 \\
+5 & 150 & 300 & 100 & 192 & 0.40 & 0.30 & 0.05 & 2.5 & 1.0 \\
+\bottomrule
+\end{tabular}
+\caption{Proposed TIG tracks for Level 2. Here $n$ is nodes, $L$ is lines, $m$ is batteries, $H$ is time steps, $\gamma_{\mathrm{cong}}$ scales line limits, $\sigma$ is volatility, $(\rho_{\mathrm{jump}},\alpha)$ control tail risk, and $h$ controls fleet heterogeneity.}
+\end{table}
+
+\paragraph{Heterogeneity mechanism (parameter $h$).}
+Let $(\overline{E}^{\mathrm{nom}},\overline{P}^{\mathrm{nom}})$ be nominal battery capacity and power for a track. For each battery $b$, draw $r_b\sim\mathrm{Uniform}(0,1)$ and set a multiplicative factor $M_b:=3^{h(2r_b-1)}\in[3^{-h},3^{h}]$. Then set $\overline{E}_b=\overline{E}^{\mathrm{nom}}M_b$ and $\overline{P}^c_b=\overline{P}^d_b=\overline{P}^{\mathrm{nom}}M_b$, with SOC bounds $\underline{E}_b=e_{\min}\overline{E}_b$ and $\overline{E}_b=e_{\max}\overline{E}_b$. This yields identical batteries at $h=0$ and up to a $3\times$ spread at $h=1$, matching the intended interpretation.
+
+\paragraph{Justification of the five-track ladder.}
+Track 1 is designed as a correctness-and-baseline regime: the network is small, line limits are effectively nominal ($\gamma_{\mathrm{cong}}=1$), volatility is modest, and tail events are rare and thin-tailed, so many algorithm families can be competitive and feasibility is easy to maintain. Track 2 introduces meaningful congestion by tightening limits ($\gamma_{\mathrm{cong}}=0.8$) and increasing both stochasticity and fleet diversity, making spatial coordination materially valuable without turning the problem into a pure feasibility puzzle. Track 3 increases horizon and scale simultaneously, creating the first regime in which solvers must manage multi-day energy carry, coordinate a larger portfolio, and remain robust to more frequent spikes; this tends to separate simple myopic heuristics from methods that internalize constraints and future opportunity cost. Track 4 increases network density and further tightens limits, increasing the frequency of binding line constraints and raising the importance of congestion-aware control; at the same time, heavier tails make risk management and degradation/friction tradeoffs central. Track 5 is intended as the capstone: large network, large portfolio, tight limits, high volatility, and heavy tails together produce a regime where profitable operation requires consistently feasible coordination and disciplined response to rare but dominant scarcity events, while verification remains a straightforward replay.
+
+\section{Table of variables and definitions}\label{app:notation}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.22\textwidth}p{0.74\textwidth}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+$H$ & Number of discrete time steps in the horizon. \\
+$\Delta t$ & Duration (hours) of one time step. \\
+$t$ & Time index, $t\in\{0,\dots,H-1\}$. \\
+$\mathcal{N}, n$ & Set of nodes and its size. \\
+$\mathcal{L}, L$ & Set of lines and its size. \\
+$\mathcal{B}, m$ & Set of batteries and its size. \\
+$\nu(b)$ & Node index where battery $b$ is located. \\
+$u_{b,t}$ & Signed battery power (MW): discharge if positive, charge if negative. \\
+$c_{b,t}, d_{b,t}$ & Derived charge/discharge powers (MW), $(\cdot)_+$ decomposition. \\
+$\overline{P}^c_b,\overline{P}^d_b$ & Charge/discharge power limits (MW). \\
+$E_{b,t}$ & Battery state of charge at time $t$ (MWh). \\
+$\underline{E}_b,\overline{E}_b$ & SOC lower and upper bounds (MWh). \\
+$\eta^c_b,\eta^d_b$ & Charge/discharge efficiency parameters. \\
+$p^{\mathrm{exo}}_{i,t}$ & Exogenous nodal injection (MW) at node $i$ and time $t$. \\
+$p^{\mathrm{stor}}_{i,t}$ & Storage-induced nodal injection (MW). \\
+$p_{i,t}$ & Total nodal injection (MW), including slack balancing at $s$. \\
+$s$ & Slack bus index. \\
+$\mathrm{PTDF}$ & PTDF matrix mapping nodal injections to line flows under DC approximation. \\
+$f_{\ell,t}$ & Flow on line $\ell$ at time $t$ (MW). \\
+$\overline{F}^{\mathrm{nom}}_\ell$ & Nominal thermal limit of line $\ell$ (MW). \\
+$\gamma_{\mathrm{cong}}$ & Track parameter scaling line limits: $\overline{F}_\ell=\gamma_{\mathrm{cong}}\overline{F}^{\mathrm{nom}}_\ell$. \\
+$\lambda^{\mathrm{DA}}_{i,t}$ & Day-ahead nodal price forecast (\$/MWh). \\
+$\lambda^{\mathrm{RT}}_{i,t}$ & Real-time nodal price (\$/MWh) generated sequentially. \\
+$s_t$ & Commitment seed at time $t$ (256-bit). \\
+$q_u,q_E$ & Quantization steps for hashing actions and SOCs. \\
+$\tilde{u}_{b,t},\tilde{E}_{b,t}$ & Quantized integer versions of $u_{b,t}$ and $E_{b,t}$. \\
+$\mu,\sigma$ & Bias and volatility of multiplicative price shock. \\
+$\rho_{\mathrm{sp}}$ & Spatial correlation of nodal shocks. \\
+$\mathbf{1}^{\mathrm{cong}}_{i,t}$ & Congestion indicator used in price at node $i$, time $t$. \\
+$\tau_{\mathrm{cong}}$ & Threshold defining ``near-binding'' line utilization. \\
+$\gamma_{\mathrm{price}}$ & Congestion premium scale in price model. \\
+$\rho_{\mathrm{jump}},\alpha$ & Jump probability and Pareto tail index for scarcity component. \\
+$J_{i,t}$ & Jump/scarcity price component at node $i$, time $t$. \\
+$\phi_b(\cdot)$ & Friction function (transaction + degradation costs). \\
+$R_t$ & Portfolio profit at time $t$ (objective increment). \\
+$h$ & Track parameter controlling heterogeneity of battery parameters. \\
+
+\end{longtable}
+
+\end{document}
