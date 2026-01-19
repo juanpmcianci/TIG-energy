@@ -159,9 +159,86 @@ The challenge has two distinct sources of hardness: coupled feasibility under ne
 A verifier is given the full instance data, the initial seed $s_0$, and the submitted action array $\{u_{b,t}\}$. Verification proceeds deterministically as follows. At $t=0$, the verifier initializes SOCs at the specified $E_{b,0}$ and computes $\lambda^{\mathrm{RT}}_{\cdot,0}$ from $s_0$ using \eqref{eq:lmp} with $\mathbf{1}^{\mathrm{cong}}_{\cdot,0}=0$. For each $t=0,1,\dots,H-1$, it (i) quantizes $u_{b,t}$ and $E_{b,t}$, (ii) updates SOCs via \eqref{eq:soc} and checks SOC bounds, (iii) computes $p_{\cdot,t}$ including slack balancing and then flows $f_{\cdot,t}$ via \eqref{eq:flows}, checking \eqref{eq:limits}, (iv) computes the period profit $R_t$ via \eqref{eq:reward}--\eqref{eq:friction}, (v) forms $\mathbf{1}^{\mathrm{cong}}_{\cdot,t+1}$ from $f_{\cdot,t}$, (vi) updates $s_{t+1}$ via \eqref{eq:seed}, and (vii) generates $\lambda^{\mathrm{RT}}_{\cdot,t+1}$ via \eqref{eq:lmp}. The reported score is the sum of verified profits. Computational cost is $O\!\left(H\cdot(Ln+m)\right)$ operations with small constants; no optimization is performed during verification.
 
 \section{Instance generation (reference design)}
-Instances are generated from a single master seed and track parameters. The generator produces a connected network graph with $(n,L)$ and assigns line susceptances; it then constructs the PTDF matrix for a chosen slack bus. Exogenous injections $p^{\mathrm{exo}}_{i,t}$ are sampled as a low-rank spatiotemporal process (for example, two time factors times two node loading patterns plus small noise), then rebalanced at the slack bus, and finally rescaled if necessary so that, under zero storage actions, flows satisfy $|f_{\ell,t}|\le \overline{F}^{\mathrm{nom}}_\ell$ for all $\ell,t$. This feasibility guarantee ensures that each instance admits at least one valid submission.
+Instances are generated from a single master seed and track parameters. This section provides the detailed algorithms used in the reference implementation.
 
-Day-ahead prices are generated as a smooth diurnal baseline plus node offsets and a correlated residual. Concretely, the generator sets a baseline $\bar{\lambda}_t=\lambda_0+A\sin(2\pi t\Delta t/24-\pi/2)$, draws node offsets $\delta_i$, and adds a small stationary AR(1) residual $\eta_{i,t}$; it then sets $\lambda^{\mathrm{DA}}_{i,t}=\max\{\lambda_{\mathrm{DA,min}},\bar{\lambda}_t+\delta_i+\eta_{i,t}\}$. Batteries are placed uniformly at random across nodes (allowing multiple batteries per node). Nominal battery parameters are assigned and then perturbed by a heterogeneity mechanism controlled by $h$ (Appendix~\ref{app:tracks}); friction parameters are set to track defaults unless explicitly varied.
+\subsection{Network topology and PTDF matrix}
+The generator first produces a connected network graph with $n$ nodes and $L$ lines. Connectivity is ensured by building a spanning tree (selecting $n-1$ edges to connect all nodes), then adding $L-(n-1)$ additional edges uniformly at random among non-existing pairs. Each line $\ell$ connecting nodes $i$ and $j$ is assigned a susceptance $b_\ell = b_{\mathrm{base}}\cdot(0.8 + 0.4\,r_\ell)$ where $r_\ell\sim\mathrm{Uniform}(0,1)$ and $b_{\mathrm{base}}=10$. Nominal flow limits are similarly perturbed: $\overline{F}^{\mathrm{nom}}_\ell = \overline{F}_{\mathrm{base}}\cdot(0.8+0.4\,r'_\ell)$ with $\overline{F}_{\mathrm{base}}=100$ MW.
+
+The PTDF matrix is constructed via the standard DC power flow derivation:
+\begin{enumerate}
+\item \textbf{Build the bus susceptance matrix} $\mathbf{B}\in\mathbb{R}^{n\times n}$:
+\[
+B_{ii} = \sum_{\ell:\,i\in\ell} b_\ell, \qquad B_{ij} = -b_\ell \text{ if line } \ell \text{ connects } i \text{ and } j, \qquad B_{ij}=0 \text{ otherwise}.
+\]
+\item \textbf{Form the reduced matrix} $\mathbf{B}_{\mathrm{red}}\in\mathbb{R}^{(n-1)\times(n-1)}$ by deleting the row and column corresponding to the slack bus $s$.
+\item \textbf{Invert} to obtain $\mathbf{X}_{\mathrm{red}}=\mathbf{B}_{\mathrm{red}}^{-1}$.
+\item \textbf{Expand} back to $\mathbf{X}\in\mathbb{R}^{n\times n}$ by inserting zeros in the slack row and column.
+\item \textbf{Compute PTDF entries}: for each line $\ell=(i,j)$ and injection node $k$,
+\[
+\mathrm{PTDF}_{\ell k} = b_\ell\,(X_{ik} - X_{jk}).
+\]
+\end{enumerate}
+
+\subsection{Exogenous nodal injections $p^{\mathrm{exo}}_{i,t}$}
+Exogenous injections are generated as a low-rank spatiotemporal process to produce realistic correlated load patterns:
+\begin{enumerate}
+\item \textbf{Define two temporal basis functions} (sinusoidal load curves):
+\[
+\varphi_1(t) = \sin\!\left(\frac{2\pi t}{96}\right), \qquad \varphi_2(t) = \sin\!\left(\frac{2\pi t}{48} + \frac{\pi}{4}\right).
+\]
+\item \textbf{Draw two spatial loading patterns}: for each node $i\ne s$, draw $\psi_1(i),\psi_2(i)\sim\mathrm{Uniform}(-0.5,0.5)$.
+\item \textbf{Combine with noise}: for $i\ne s$,
+\[
+p^{\mathrm{exo}}_{i,t} = p_{\mathrm{base}}\,(r_{i,t}-0.5) + \gamma_{\mathrm{pat}}\bigl(\psi_1(i)\,\varphi_1(t)+\psi_2(i)\,\varphi_2(t)\bigr) + \gamma_{\mathrm{noise}}\,\varepsilon_{i,t},
+\]
+where $r_{i,t}\sim\mathrm{Uniform}(0,1)$, $\varepsilon_{i,t}\sim\mathcal{N}(0,1)$, and default scales are $p_{\mathrm{base}}=50$ MW, $\gamma_{\mathrm{pat}}=20$, $\gamma_{\mathrm{noise}}=2$.
+\item \textbf{Balance at slack bus}:
+\[
+p^{\mathrm{exo}}_{s,t} = -\sum_{i\in\mathcal{N}\setminus\{s\}} p^{\mathrm{exo}}_{i,t}.
+\]
+\item \textbf{Rescale for feasibility}: compute flows under zero storage actions; if any $|f_{\ell,t}|>\gamma_{\mathrm{margin}}\,\overline{F}_\ell$ (with $\gamma_{\mathrm{margin}}=0.7$), uniformly scale all $p^{\mathrm{exo}}_{i,t}$ down and rebalance at slack. This ensures headroom for battery dispatch.
+\end{enumerate}
+
+\subsection{Day-ahead nodal prices $\lambda^{\mathrm{DA}}_{i,t}$}
+Day-ahead prices combine a smooth system-wide baseline with node-specific offsets and temporal correlation:
+\begin{enumerate}
+\item \textbf{Generate a base price curve} $\bar{\lambda}_t$ using a Gaussian process with a periodic-plus-squared-exponential kernel:
+\[
+K(\tau) = \sigma_{\mathrm{per}}^2\exp\!\left(-\frac{2\sin^2(\pi|\tau|/T_{\mathrm{per}})}{\ell_{\mathrm{per}}^2}\right) + \sigma_{\mathrm{SE}}^2\exp\!\left(-\frac{\tau^2}{2\ell_{\mathrm{SE}}^2}\right),
+\]
+where $\tau=|t_1-t_2|\cdot\Delta t$ is the time difference in hours, $T_{\mathrm{per}}=24$ h, and default hyperparameters are $\sigma_{\mathrm{per}}=10$, $\ell_{\mathrm{per}}=2$, $\sigma_{\mathrm{SE}}=5$, $\ell_{\mathrm{SE}}=4$. The GP sample is obtained via Cholesky decomposition of the covariance matrix.
+\item \textbf{Add a diurnal pattern}:
+\[
+\bar{\lambda}_t \leftarrow \bar{\lambda}_t + \lambda_0 + A\sin\!\left(\frac{2\pi\,(t\,\Delta t)}{24}-\frac{\pi}{2}\right),
+\]
+with $\lambda_0=50$ \$/MWh and $A=20$ \$/MWh.
+\item \textbf{Draw node offsets} $\delta_i$: for each node $i$,
+\[
+\delta_i = 5\,(r_i - 0.5), \qquad r_i\sim\mathrm{Uniform}(0,1).
+\]
+\item \textbf{Generate AR(1) residuals} $\eta_{i,t}$: for each node $i$, initialize $\eta_{i,0}=0$ and evolve
+\[
+\eta_{i,t} = \rho_{\mathrm{AR}}\,\eta_{i,t-1} + \sqrt{1-\rho_{\mathrm{AR}}^2}\cdot 2\,z_{i,t}, \qquad z_{i,t}\sim\mathcal{N}(0,1),
+\]
+with $\rho_{\mathrm{AR}}=0.8$.
+\item \textbf{Assemble nodal prices}:
+\[
+\lambda^{\mathrm{DA}}_{i,t} = \max\bigl\{\lambda_{\mathrm{DA,min}},\;\bar{\lambda}_t + \delta_i + \eta_{i,t}\bigr\}.
+\]
+\end{enumerate}
+
+\subsection{Battery placement and parameters}
+Batteries are placed uniformly at random across nodes (allowing multiple batteries per node). Nominal battery parameters $(\overline{E}^{\mathrm{nom}},\overline{P}^{\mathrm{nom}})$ are perturbed by the heterogeneity mechanism controlled by $h$ (Appendix~\ref{app:tracks}); friction parameters are set to track defaults unless explicitly varied.
+
+\section{Baseline algorithm}
+The reference implementation includes a \textbf{flow-aware greedy heuristic} as the baseline solver (see \texttt{level2\_greedy.rs} in the code repository). At each time step $t$, the algorithm:
+\begin{enumerate}
+\item Computes the average day-ahead price $\bar{\lambda}_t^{\mathrm{DA}}=\frac{1}{n}\sum_{i}\lambda^{\mathrm{DA}}_{i,t}$.
+\item For each battery $b$ at node $\nu(b)$: if $\lambda^{\mathrm{DA}}_{\nu(b),t}<0.95\,\bar{\lambda}_t^{\mathrm{DA}}$ and SOC headroom permits, sets $u_{b,t}=-\overline{P}^c_b$ (full charge); if $\lambda^{\mathrm{DA}}_{\nu(b),t}>1.05\,\bar{\lambda}_t^{\mathrm{DA}}$ and SOC permits, sets $u_{b,t}=+\overline{P}^d_b$ (full discharge); otherwise idles.
+\item Iteratively adjusts actions to satisfy network flow constraints: identifies the most violated line, scales down actions of batteries whose PTDF contributions worsen the violation, and repeats until feasible or a maximum iteration count is reached.
+\item If violations persist, applies binary search over a global scaling factor $\alpha\in[0,1]$ to find the largest $\alpha$ such that $\alpha\cdot u_{\cdot,t}$ is flow-feasible.
+\end{enumerate}
+This greedy baseline is intentionally simple; it does not perform lookahead or stochastic optimization, making it a natural lower bound for more sophisticated solvers.
 
 \appendix
 
