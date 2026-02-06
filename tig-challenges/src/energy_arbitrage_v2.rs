@@ -1,12 +1,10 @@
 /*!
- * Energy Arbitrage Challenge for TIG - Version 2
+ * Energy Arbitrage Challenge for TIG - Network Version
  *
  * Implementation of the "Optimal Arbitrage of Networked Energy Storage" challenge
  * as specified in tig_level_2_spec.tex.
  *
- * Two-level challenge:
- * - Level 1: Single-asset temporal arbitrage with action-committed pricing
- * - Level 2: Portfolio arbitrage on a transmission-constrained network with 5 tracks
+ * Portfolio arbitrage on a transmission-constrained network with 5 tracks.
  *
  * Key features:
  * - Action-committed pricing via SHA-256 hash chain
@@ -120,7 +118,7 @@ pub mod constants {
 // Track Definitions (from spec Appendix B)
 // ============================================================================
 
-/// TIG Track identifier for Level 2 challenge.
+/// TIG Track identifier for the challenge.
 /// Each track defines a specific parameter regime with increasing difficulty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Track {
@@ -264,22 +262,6 @@ pub struct BatterySpec {
 }
 
 impl BatterySpec {
-    /// Create default single battery for Level 1
-    pub fn default_single() -> Self {
-        let cap = constants::NOMINAL_CAPACITY;
-        Self {
-            id: 0,
-            capacity_mwh: cap,
-            power_charge_mw: constants::NOMINAL_POWER,
-            power_discharge_mw: constants::NOMINAL_POWER,
-            efficiency_charge: constants::ETA_CHARGE,
-            efficiency_discharge: constants::ETA_DISCHARGE,
-            soc_min_mwh: constants::E_MIN_FRAC * cap,
-            soc_max_mwh: constants::E_MAX_FRAC * cap,
-            soc_initial_mwh: constants::E_INIT_FRAC * cap,
-        }
-    }
-
     /// Create battery with given capacity using default parameters
     pub fn with_capacity(id: usize, capacity_mwh: f64, power_mw: f64) -> Self {
         Self {
@@ -351,280 +333,7 @@ impl Default for MarketParams {
 }
 
 // ============================================================================
-// Level 1: Single-Asset Temporal Arbitrage
-// ============================================================================
-
-/// Difficulty parameters for Level 1
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Level1Difficulty {
-    /// Number of time steps (hours)
-    pub num_steps: usize,
-    /// Price volatility σ ∈ [0.1, 0.5]
-    pub volatility: f64,
-    /// Tail index α ∈ (2, 5] - lower = heavier tails
-    pub tail_index: f64,
-    /// Transaction cost per MWh
-    pub transaction_cost: f64,
-    /// Degradation cost per MWh
-    pub degradation_cost: f64,
-    /// Required profit threshold
-    pub profit_threshold: f64,
-}
-
-impl Default for Level1Difficulty {
-    fn default() -> Self {
-        Self {
-            num_steps: 24,
-            volatility: 0.2,
-            tail_index: 3.0,
-            transaction_cost: constants::KAPPA_TX,
-            degradation_cost: constants::KAPPA_DEG,
-            profit_threshold: 0.0,
-        }
-    }
-}
-
-/// Action at a single time step (Level 1 uses separate charge/discharge)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Action {
-    pub charge_mw: f64,
-    pub discharge_mw: f64,
-}
-
-impl Action {
-    pub fn idle() -> Self {
-        Self { charge_mw: 0.0, discharge_mw: 0.0 }
-    }
-
-    pub fn charge(power: f64) -> Self {
-        Self { charge_mw: power.max(0.0), discharge_mw: 0.0 }
-    }
-
-    pub fn discharge(power: f64) -> Self {
-        Self { charge_mw: 0.0, discharge_mw: power.max(0.0) }
-    }
-
-    /// Convert to signed power (positive = discharge, negative = charge)
-    pub fn to_signed_power(&self) -> f64 {
-        self.discharge_mw - self.charge_mw
-    }
-
-    /// Create from signed power (positive = discharge, negative = charge)
-    pub fn from_signed_power(u: f64, max_charge: f64, max_discharge: f64) -> Self {
-        if u >= 0.0 {
-            Self::discharge(u.min(max_discharge))
-        } else {
-            Self::charge((-u).min(max_charge))
-        }
-    }
-}
-
-/// Transcript entry for Level 1 verification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptEntry {
-    pub time_step: usize,
-    pub action: Action,
-    pub soc_mwh: f64,
-    pub seed: [u8; 32],
-    pub rt_price: f64,
-    pub profit: f64,
-}
-
-/// Level 1 Challenge: Single battery with action-committed pricing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Level1Challenge {
-    pub seed: [u8; 32],
-    pub difficulty: Level1Difficulty,
-    pub battery: BatterySpec,
-    pub frictions: Frictions,
-    pub market: MarketParams,
-    /// Day-ahead price curve (known at t=0)
-    pub day_ahead_prices: Vec<f64>,
-}
-
-/// Level 1 Solution: A transcript of actions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Level1Solution {
-    pub transcript: Vec<TranscriptEntry>,
-}
-
-impl Level1Challenge {
-    /// Generate a Level 1 challenge instance
-    pub fn generate_instance(seed: [u8; 32], difficulty: &Level1Difficulty) -> Result<Self> {
-        let mut rng = SmallRng::from_seed(StdRng::from_seed(seed).gen());
-        let t = difficulty.num_steps;
-
-        let day_ahead_prices = generate_da_prices(&mut rng, t);
-        let battery = BatterySpec::default_single();
-
-        let frictions = Frictions {
-            transaction_cost_per_mwh: difficulty.transaction_cost,
-            degradation_scale: difficulty.degradation_cost,
-            degradation_exponent: constants::BETA_DEG,
-        };
-
-        let market = MarketParams {
-            volatility: difficulty.volatility,
-            jump_probability: 0.05,
-            tail_index: difficulty.tail_index,
-            mean_bias: 0.0,
-            ..Default::default()
-        };
-
-        Ok(Level1Challenge {
-            seed,
-            difficulty: difficulty.clone(),
-            battery,
-            frictions,
-            market,
-            day_ahead_prices,
-        })
-    }
-
-    /// Generate real-time price based on action-committed seed
-    pub fn generate_rt_price(&self, da_price: f64, committed_seed: &[u8; 32]) -> f64 {
-        let mut rng = SmallRng::from_seed(*committed_seed);
-
-        // Normal noise via Box-Muller
-        let noise = box_muller_normal(&mut rng);
-        let base_price = da_price * (1.0 + self.market.mean_bias + self.market.volatility * noise);
-
-        // Jump component (Pareto tail)
-        let jump = if rng.gen::<f64>() < self.market.jump_probability {
-            let u: f64 = rng.gen::<f64>().max(1e-10);
-            let pareto = (1.0 - u).powf(-1.0 / self.market.tail_index) - 1.0;
-            da_price * pareto
-        } else {
-            0.0
-        };
-
-        (base_price + jump).clamp(constants::LAMBDA_MIN, constants::LAMBDA_MAX)
-    }
-
-    /// Commit to an action and compute next seed
-    pub fn commit_action(
-        &self,
-        current_seed: &[u8; 32],
-        action: &Action,
-        time_step: usize,
-        soc: f64,
-    ) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(current_seed);
-        hasher.update(action.charge_mw.to_le_bytes());
-        hasher.update(action.discharge_mw.to_le_bytes());
-        hasher.update((time_step as u64).to_le_bytes());
-        hasher.update(soc.to_le_bytes());
-
-        let result = hasher.finalize();
-        let mut new_seed = [0u8; 32];
-        new_seed.copy_from_slice(&result);
-        new_seed
-    }
-
-    /// Compute step profit
-    pub fn compute_step_profit(&self, action: &Action, rt_price: f64, dt: f64) -> f64 {
-        let c = action.charge_mw;
-        let d = action.discharge_mw;
-
-        let revenue = (d - c) * rt_price * dt;
-        let tx_cost = self.frictions.transaction_cost_per_mwh * (c + d) * dt;
-        let dod = (d * dt / self.battery.capacity_mwh).powf(self.frictions.degradation_exponent);
-        let deg_cost = self.frictions.degradation_scale * dod;
-
-        revenue - tx_cost - deg_cost
-    }
-
-    /// Apply action and return new SOC
-    pub fn apply_action(&self, soc: f64, action: &Action, dt: f64) -> f64 {
-        let new_soc = soc
-            + self.battery.efficiency_charge * action.charge_mw * dt
-            - action.discharge_mw * dt / self.battery.efficiency_discharge;
-
-        new_soc.clamp(self.battery.soc_min_mwh, self.battery.soc_max_mwh)
-    }
-
-    /// Verify a solution transcript
-    pub fn verify_solution(&self, solution: &Level1Solution) -> Result<f64> {
-        let t = self.difficulty.num_steps;
-
-        if solution.transcript.len() != t {
-            return Err(anyhow!(
-                "Transcript has {} entries, expected {}",
-                solution.transcript.len(), t
-            ));
-        }
-
-        if solution.transcript[0].seed != self.seed {
-            return Err(anyhow!("Initial seed mismatch"));
-        }
-
-        let mut current_seed = self.seed;
-        let mut soc = self.battery.soc_initial_mwh;
-        let mut total_profit = 0.0;
-
-        for (i, entry) in solution.transcript.iter().enumerate() {
-            if entry.time_step != i {
-                return Err(anyhow!("Time step mismatch at entry {}", i));
-            }
-
-            if entry.seed != current_seed {
-                return Err(anyhow!("Seed mismatch at step {}", i));
-            }
-
-            let action = &entry.action;
-            if action.charge_mw < 0.0 || action.charge_mw > self.battery.power_charge_mw + 1e-6 {
-                return Err(anyhow!("Charge power out of bounds at step {}", i));
-            }
-            if action.discharge_mw < 0.0 || action.discharge_mw > self.battery.power_discharge_mw + 1e-6 {
-                return Err(anyhow!("Discharge power out of bounds at step {}", i));
-            }
-            if action.charge_mw > 1e-6 && action.discharge_mw > 1e-6 {
-                return Err(anyhow!("Simultaneous charge/discharge at step {}", i));
-            }
-
-            let rt_price = self.generate_rt_price(self.day_ahead_prices[i], &current_seed);
-            if (rt_price - entry.rt_price).abs() > 1e-6 {
-                return Err(anyhow!(
-                    "RT price mismatch at step {}: computed {}, transcript {}",
-                    i, rt_price, entry.rt_price
-                ));
-            }
-
-            let new_soc = self.apply_action(soc, action, 1.0);
-            if (new_soc - entry.soc_mwh).abs() > 1e-6 {
-                return Err(anyhow!(
-                    "SOC mismatch at step {}: computed {}, transcript {}",
-                    i, new_soc, entry.soc_mwh
-                ));
-            }
-
-            let profit = self.compute_step_profit(action, rt_price, 1.0);
-            if (profit - entry.profit).abs() > 1e-6 {
-                return Err(anyhow!(
-                    "Profit mismatch at step {}: computed {}, transcript {}",
-                    i, profit, entry.profit
-                ));
-            }
-
-            total_profit += profit;
-            soc = new_soc;
-            current_seed = self.commit_action(&current_seed, action, i, soc);
-        }
-
-        if total_profit < self.difficulty.profit_threshold {
-            return Err(anyhow!(
-                "Total profit {:.2} below threshold {:.2}",
-                total_profit, self.difficulty.profit_threshold
-            ));
-        }
-
-        Ok(total_profit)
-    }
-}
-
-// ============================================================================
-// Level 2: Portfolio Arbitrage on Constrained Network
+// Network and Challenge Types
 // ============================================================================
 
 /// Network topology and DC power flow parameters
@@ -730,22 +439,34 @@ impl Network {
             connected_count += 1;
         }
 
-        // Phase 2: Add extra lines to reach target
-        let _extra_lines = num_lines.saturating_sub(num_nodes - 1);
-        let mut attempts = 0;
-        while lines.len() < num_lines && attempts < 10000 {
-            let i = rng.gen_range(0..num_nodes);
-            let j = rng.gen_range(0..num_nodes);
-            if i != j {
-                let (from, to) = if i < j { (i, j) } else { (j, i) };
-                // Check if edge already exists
-                if !lines.contains(&(from, to)) {
-                    lines.push((from, to));
-                    susceptances.push(constants::BASE_SUSCEPTANCE * (0.8 + 0.4 * rng.gen::<f64>()));
-                    nominal_limits.push(constants::NOMINAL_FLOW_LIMIT * (0.8 + 0.4 * rng.gen::<f64>()));
+        // Phase 2: Add extra lines to reach target by sampling from non-existing edges
+        let extra_needed = num_lines.saturating_sub(lines.len());
+        if extra_needed > 0 {
+            // Build set of existing edges for O(1) lookup
+            let existing: std::collections::HashSet<(usize, usize)> =
+                lines.iter().cloned().collect();
+
+            // Build list of all non-existing edges
+            let mut candidates: Vec<(usize, usize)> = Vec::new();
+            for i in 0..num_nodes {
+                for j in (i + 1)..num_nodes {
+                    if !existing.contains(&(i, j)) {
+                        candidates.push((i, j));
+                    }
                 }
             }
-            attempts += 1;
+
+            // Randomly select using Fisher-Yates partial shuffle
+            let to_add = extra_needed.min(candidates.len());
+            for k in 0..to_add {
+                let idx = rng.gen_range(k..candidates.len());
+                candidates.swap(k, idx);
+
+                let (from, to) = candidates[k];
+                lines.push((from, to));
+                susceptances.push(constants::BASE_SUSCEPTANCE * (0.8 + 0.4 * rng.gen::<f64>()));
+                nominal_limits.push(constants::NOMINAL_FLOW_LIMIT * (0.8 + 0.4 * rng.gen::<f64>()));
+            }
         }
 
         Self::new(num_nodes, lines, susceptances, nominal_limits, gamma_cong)
@@ -852,7 +573,7 @@ impl Network {
     }
 }
 
-/// Difficulty parameters for Level 2
+/// Difficulty parameters for the challenge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level2Difficulty {
     /// Track identifier (determines most parameters)
@@ -924,7 +645,7 @@ pub struct PlacedBattery {
     pub node: usize,
 }
 
-/// Level 2 Challenge
+/// The Challenge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level2Challenge {
     /// Initial commitment seed (s_0)
@@ -975,41 +696,14 @@ impl SignedAction {
     }
 }
 
-/// Portfolio action at a single time step (Level 2)
+/// Portfolio action at a single time step
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioAction {
     /// Signed power actions for each battery
     pub actions: Vec<SignedAction>,
 }
 
-impl PortfolioAction {
-    /// Create from legacy Action format (for backward compatibility)
-    pub fn from_legacy(battery_actions: Vec<Action>) -> Self {
-        Self {
-            actions: battery_actions
-                .into_iter()
-                .map(|a| SignedAction::new(a.to_signed_power()))
-                .collect(),
-        }
-    }
-
-    /// Convert to legacy format
-    pub fn to_legacy(&self, batteries: &[PlacedBattery]) -> Vec<Action> {
-        self.actions
-            .iter()
-            .zip(batteries.iter())
-            .map(|(a, b)| {
-                Action::from_signed_power(
-                    a.power_mw,
-                    b.spec.power_charge_mw,
-                    b.spec.power_discharge_mw,
-                )
-            })
-            .collect()
-    }
-}
-
-/// Level 2 Solution: schedule of portfolio actions
+/// The Solution: schedule of portfolio actions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level2Solution {
     /// Schedule for each time step
@@ -1017,7 +711,7 @@ pub struct Level2Solution {
 }
 
 impl Level2Challenge {
-    /// Generate a Level 2 challenge instance
+    /// Generate a challenge instance
     pub fn generate_instance(seed: [u8; 32], difficulty: &Level2Difficulty) -> Result<Self> {
         let mut rng = SmallRng::from_seed(StdRng::from_seed(seed).gen());
         let params = difficulty.effective_params();
@@ -1523,39 +1217,9 @@ impl Level2Challenge {
         Ok(total_profit)
     }
 
-    /// Compute nodal injections from portfolio action (legacy compatibility)
+    /// Compute nodal injections from portfolio action
     pub fn compute_injections(&self, portfolio_action: &PortfolioAction) -> Vec<f64> {
         self.compute_storage_injections(portfolio_action)
-    }
-}
-
-// ============================================================================
-// Legacy API Compatibility
-// ============================================================================
-
-/// Legacy PortfolioAction with separate charge/discharge
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegacyPortfolioAction {
-    pub battery_actions: Vec<Action>,
-}
-
-impl From<LegacyPortfolioAction> for PortfolioAction {
-    fn from(legacy: LegacyPortfolioAction) -> Self {
-        PortfolioAction::from_legacy(legacy.battery_actions)
-    }
-}
-
-/// Legacy solution format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegacyLevel2Solution {
-    pub schedule: Vec<LegacyPortfolioAction>,
-}
-
-impl From<LegacyLevel2Solution> for Level2Solution {
-    fn from(legacy: LegacyLevel2Solution) -> Self {
-        Level2Solution {
-            schedule: legacy.schedule.into_iter().map(|a| a.into()).collect(),
-        }
     }
 }
 
@@ -1674,82 +1338,60 @@ fn prng_normal(seed: &[u8; 32], counter: u64) -> f64 {
 
 /// Cholesky decomposition (lower triangular)
 fn cholesky(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let n = a.len();
-    let mut l = vec![vec![0.0; n]; n];
+    use nalgebra::DMatrix;
 
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = 0.0;
-            for k in 0..j {
-                sum += l[i][k] * l[j][k];
-            }
-            if i == j {
-                l[i][j] = (a[i][i] - sum).max(1e-10).sqrt();
-            } else {
-                l[i][j] = (a[i][j] - sum) / l[j][j];
-            }
-        }
-    }
-    l
-}
-
-/// Simple matrix inversion via Gaussian elimination with pivoting
-fn invert_matrix(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = a.len();
     if n == 0 {
         return vec![];
     }
 
-    // Augmented matrix [A | I]
-    let mut aug = vec![vec![0.0; 2 * n]; n];
+    // Build nalgebra matrix
+    let matrix = DMatrix::from_fn(n, n, |i, j| a[i][j]);
+
+    // Cholesky decomposition - returns lower triangular L where A = L * L^T
+    let chol = matrix
+        .cholesky()
+        .expect("Covariance matrix should be positive definite");
+
+    // Extract lower triangular factor
+    let l_matrix = chol.l();
+
+    // Convert back to Vec<Vec<f64>>
+    let mut l = vec![vec![0.0; n]; n];
     for i in 0..n {
         for j in 0..n {
-            aug[i][j] = a[i][j];
-        }
-        aug[i][n + i] = 1.0;
-    }
-
-    // Forward elimination with partial pivoting
-    for i in 0..n {
-        // Find pivot
-        let mut max_row = i;
-        for k in (i + 1)..n {
-            if aug[k][i].abs() > aug[max_row][i].abs() {
-                max_row = k;
-            }
-        }
-        aug.swap(i, max_row);
-
-        let pivot = aug[i][i];
-        if pivot.abs() < 1e-12 {
-            // Singular - return identity as fallback
-            return (0..n).map(|i| {
-                (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect()
-            }).collect();
-        }
-
-        for j in 0..(2 * n) {
-            aug[i][j] /= pivot;
-        }
-
-        for k in 0..n {
-            if k != i {
-                let factor = aug[k][i];
-                for j in 0..(2 * n) {
-                    aug[k][j] -= factor * aug[i][j];
-                }
-            }
+            l[i][j] = l_matrix[(i, j)];
         }
     }
+    l
+}
 
-    // Extract inverse
-    let mut inv = vec![vec![0.0; n]; n];
+/// Matrix inversion via Cholesky decomposition (for symmetric positive definite matrices)
+fn invert_matrix(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    use nalgebra::DMatrix;
+
+    let n = a.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Build nalgebra matrix
+    let matrix = DMatrix::from_fn(n, n, |i, j| a[i][j]);
+
+    // Cholesky decomposition and inverse
+    let inverse = matrix
+        .cholesky()
+        .expect("B_red should be positive definite for a connected network")
+        .inverse();
+
+    // Convert back to Vec<Vec<f64>>
+    let mut result = vec![vec![0.0; n]; n];
     for i in 0..n {
         for j in 0..n {
-            inv[i][j] = aug[i][n + j];
+            result[i][j] = inverse[(i, j)];
         }
     }
-    inv
+    result
 }
 
 // ============================================================================
@@ -1778,19 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_level1_generation() {
-        let difficulty = Level1Difficulty::default();
-        let seed = [0u8; 32];
-        let challenge = Level1Challenge::generate_instance(seed, &difficulty).unwrap();
-
-        assert_eq!(challenge.day_ahead_prices.len(), 24);
-        for &p in &challenge.day_ahead_prices {
-            assert!(p >= constants::LAMBDA_DA_MIN);
-        }
-    }
-
-    #[test]
-    fn test_level2_generation_track1() {
+    fn test_challenge_generation_track1() {
         let difficulty = Level2Difficulty::from_track(Track::Track1);
         let seed = [42u8; 32];
         let challenge = Level2Challenge::generate_instance(seed, &difficulty).unwrap();

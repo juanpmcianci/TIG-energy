@@ -1,8 +1,6 @@
-//! Energy Arbitrage V2 algorithms
+//! Energy Arbitrage Network algorithms
 //!
-//! Implementations for both Level 1 (single-asset) and Level 2 (portfolio) challenges.
+//! Solvers for portfolio arbitrage on transmission-constrained networks.
 
-pub mod level1_greedy;
-pub mod level1_dp;
 pub mod level2_greedy;
 pub mod level2_decomposition;
