@@ -1,0 +1,163 @@
+name: Build Algorithm
+
+on: 
+  push:
+    branches:
+      - 'satisfiability/*'
+      - 'vehicle_routing/*'
+      - 'knapsack/*'
+      - 'vector_search/*'
+      - 'hypergraph/*'
+      - 'neuralnet_optimizer/*'
+      - 'test/satisfiability/*'
+      - 'test/vehicle_routing/*'
+      - 'test/knapsack/*'
+      - 'test/vector_search/*'
+      - 'test/hypergraph/*'
+      - 'test/neuralnet_optimizer/*'
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    outputs:
+      SKIP_JOB: ${{ steps.check.outputs.SKIP_JOB }}
+      CHALLENGE: ${{ steps.check.outputs.CHALLENGE }}
+      ALGORITHM: ${{ steps.check.outputs.ALGORITHM }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check challenge and algorithm
+        id: check
+        run: |
+          CHALLENGE=`echo $GITHUB_REF_NAME | rev | cut -d/ -f2 | rev`
+          ALGORITHM=`echo $GITHUB_REF_NAME | rev | cut -d/ -f1 | rev`
+          if [ -f tig-algorithms/lib/${CHALLENGE}/${ALGORITHM}.tar.gz ]; then
+            echo "SKIP_JOB=true" >> $GITHUB_OUTPUT
+          else
+            echo "SKIP_JOB=false" >> $GITHUB_OUTPUT
+          fi
+          echo "CHALLENGE=$CHALLENGE" >> $GITHUB_OUTPUT
+          echo "ALGORITHM=$ALGORITHM" >> $GITHUB_OUTPUT
+          
+  build_arm64:
+    needs: init
+    if: needs.init.outputs.SKIP_JOB == 'false'
+    name: Compile algorithm on arm64
+    runs-on: ${{ !github.event.repository.private && 'ubuntu-24.04-arm' || 'self-hosted' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space for Docker
+        run: |
+          echo "=== Disk usage BEFORE cleanup ==="
+          df -h
+
+          echo "Removing unused SDKs..."
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+
+          echo "=== Disk usage AFTER cleanup ==="
+          df -h
+
+      - name: Build Algorithm
+        run: |
+          docker run --rm --user root \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            ghcr.io/tig-foundation/tig-monorepo/${{ needs.init.outputs.CHALLENGE }}/dev:0.0.4 \
+            build_algorithm ${{ needs.init.outputs.ALGORITHM }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64
+          path: |
+            tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}/arm64
+            tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}/ptx
+
+  build_amd64:
+    needs: init
+    if: needs.init.outputs.SKIP_JOB == 'false'
+    name: Compile algorithm on amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space for Docker
+        run: |
+          echo "=== Disk usage BEFORE cleanup ==="
+          df -h
+
+          echo "Removing unused SDKs..."
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+
+          echo "=== Disk usage AFTER cleanup ==="
+          df -h
+
+      - name: Build Algorithm
+        run: |
+          docker run --rm --user root \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            ghcr.io/tig-foundation/tig-monorepo/${{ needs.init.outputs.CHALLENGE }}/dev:0.0.4 \
+            build_algorithm ${{ needs.init.outputs.ALGORITHM }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd64
+          path: |
+            tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}/amd64
+            tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}/ptx
+
+  commit:
+    needs: [init, build_arm64, build_amd64]
+    if: always() && needs.init.outputs.SKIP_JOB != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: |
+          git config --global --add safe.directory $(realpath .)
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        if: needs.build_arm64.result == 'success' && needs.build_amd64.result == 'success'
+        with:
+          path: tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}
+          merge-multiple: true
+
+      - name: Create Tarball
+        if: needs.build_arm64.result == 'success' && needs.build_amd64.result == 'success'
+        run: |
+          cd tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}
+          tar -czf ${{ needs.init.outputs.ALGORITHM }}.tar.gz */
+          rm -rf */
+
+      - name: Auto Commit
+        if: needs.build_arm64.result == 'success' && needs.build_amd64.result == 'success'
+        id: auto_commit
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: Compiled ${{ needs.init.outputs.CHALLENGE }}/${{ needs.init.outputs.ALGORITHM }}
+          file_pattern: tig-algorithms/lib/${{ needs.init.outputs.CHALLENGE }}/${{ needs.init.outputs.ALGORITHM }}.tar.gz
+
+      - name: Update Commit Status (Success)
+        if: needs.build_arm64.result == 'success' && needs.build_amd64.result == 'success'
+        uses: myrotvorets/set-commit-status-action@master
+        with:
+          status: 'success'
+          sha: ${{ steps.auto_commit.outputs.commit_hash }}
+
+      - name: Update Commit Status (Failure)
+        if: needs.build_arm64.result != 'success' || needs.build_amd64.result != 'success'
+        uses: myrotvorets/set-commit-status-action@master
+        with:
+          status: 'failure'
