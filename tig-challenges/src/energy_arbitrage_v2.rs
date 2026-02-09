@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use std::f64::consts::PI;
 
+mod baselines;
+
 // ============================================================================
 // Default Constants (from spec Appendix A)
 // ============================================================================
@@ -1085,8 +1087,8 @@ impl Level2Challenge {
         total_profit
     }
 
-    /// Verify a solution following spec Section 6
-    pub fn verify_solution(&self, solution: &Level2Solution) -> Result<f64> {
+    /// Verify a solution following spec Section 6 (constraint checks + profit)
+    fn compute_profit(&self, solution: &Level2Solution) -> Result<f64> {
         let params = self.difficulty.effective_params();
         let h = params.num_steps;
         let m = self.batteries.len();
@@ -1206,15 +1208,27 @@ impl Level2Challenge {
             let _ = &congestion_indicators; // Used for next iteration's RT price generation
         }
 
-        // Check profit threshold
-        if total_profit < self.difficulty.profit_threshold {
-            return Err(anyhow!(
-                "Total profit {:.2} below threshold {:.2}",
-                total_profit, self.difficulty.profit_threshold
-            ));
+        Ok(total_profit)
+    }
+
+    fn compute_greedy_baseline_profit(&self) -> Result<f64> {
+        let baseline_solution = baselines::level2_greedy::solve_challenge(self)?
+            .ok_or_else(|| anyhow!("Baseline solver failed to produce a solution"))?;
+        self.compute_profit(&baseline_solution)
+    }
+
+    /// Verify a solution following spec Section 6 and return better-than-baseline
+    pub fn verify_solution(&self, solution: &Level2Solution) -> Result<f64> {
+        let total_profit = self.compute_profit(solution)?;
+        let baseline_profit = self.compute_greedy_baseline_profit()?;
+
+        // Better-than-baseline (same form as knapsack): total / baseline - 1.
+        // If the baseline profit is effectively zero, fall back to absolute delta.
+        if baseline_profit.abs() < 1e-9 {
+            return Ok(total_profit - baseline_profit);
         }
 
-        Ok(total_profit)
+        Ok((total_profit / baseline_profit) - 1.0)
     }
 
     /// Compute nodal injections from portfolio action

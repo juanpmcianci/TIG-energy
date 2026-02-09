@@ -217,7 +217,7 @@ let solution = Level2Solution { schedule };
 
 // Verify
 match challenge.verify_solution(&solution) {
-    Ok(profit) => println!("Valid! Portfolio profit: ${:.2}", profit),
+    Ok(better) => println!("Valid! Better-than-baseline: {:.6}", better),
     Err(e) => println!("Invalid: {}", e),
 }
 ```
@@ -229,7 +229,7 @@ let difficulty = Level2Difficulty {
     track: Track::Track2,
     num_steps: Some(48),           // Override: shorter horizon
     congestion_factor: Some(0.5),  // Override: tighter limits
-    profit_threshold: 1000.0,      // Require minimum profit
+    profit_threshold: 1000.0,      // Optional, not enforced by verifier
     ..Default::default()
 };
 ```
@@ -272,7 +272,7 @@ Verification is O(H × L × n):
    - Compute period profit
    - Update congestion indicators for next step
    - Generate RT prices using committed seed
-3. Sum total profit and check threshold
+3. Sum total profit and compute better-than-baseline vs greedy baseline
 
 Hash commitment ensures any modification to actions invalidates subsequent prices.
 

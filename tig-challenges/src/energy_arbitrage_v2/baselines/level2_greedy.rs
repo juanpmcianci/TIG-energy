@@ -1,5 +1,5 @@
 /*!
- * Level 2 Greedy Solver
+ * Level 2 Greedy Solver (Baseline)
  *
  * Flow-aware heuristic for portfolio arbitrage on constrained network.
  * Properly accounts for exogenous injections and iteratively adjusts
@@ -9,7 +9,7 @@
  */
 
 use anyhow::Result;
-use tig_challenges::energy_arbitrage_v2::{
+use crate::energy_arbitrage_v2::{
     constants, Level2Challenge, Level2Solution, PortfolioAction, SignedAction,
 };
 
@@ -292,7 +292,7 @@ fn iterative_flow_adjustment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tig_challenges::energy_arbitrage_v2::{Level2Difficulty, Track};
+    use crate::energy_arbitrage_v2::{Level2Difficulty, Track};
 
     #[test]
     fn test_level2_greedy_track1() {

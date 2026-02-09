@@ -98,9 +98,9 @@ fn main() {
                 Ok(Some(solution)) => {
                     let elapsed = start.elapsed();
                     match challenge.verify_solution(&solution) {
-                        Ok(profit) => {
+                        Ok(better) => {
                             println!("  {}: PASS", solver_name);
-                            println!("    Portfolio Profit: ${:.2}", profit);
+                            println!("    Better-than-baseline: {:.6}", better);
                             println!("    Time: {:.2?}", elapsed);
 
                             // Show aggregate statistics

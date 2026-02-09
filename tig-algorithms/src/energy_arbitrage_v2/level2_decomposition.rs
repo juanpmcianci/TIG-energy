@@ -416,13 +416,8 @@ mod tests {
         assert_eq!(solution.schedule.len(), 24);
 
         match challenge.verify_solution(&solution) {
-            Ok(profit) => println!("Decomposition profit: {:.2}", profit),
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("below threshold") {
-                    panic!("Unexpected error: {}", e);
-                }
-            }
+            Ok(better) => println!("Decomposition better-than-baseline: {:.6}", better),
+            Err(e) => panic!("Unexpected error: {}", e),
         }
     }
 
@@ -441,7 +436,7 @@ mod tests {
             assert_eq!(solution.schedule.len(), 24);
 
             match challenge.verify_solution(&solution) {
-                Ok(profit) => println!("Track {:?}: profit ${:.2}", track, profit),
+                Ok(better) => println!("Track {:?}: better-than-baseline {:.6}", track, better),
                 Err(e) => println!("Track {:?}: {}", track, e),
             }
         }
