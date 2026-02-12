@@ -651,8 +651,11 @@ pub struct PlacedBattery {
 /// The Challenge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level2Challenge {
-    /// Initial commitment seed (s_0)
+    /// Public seed exposed to algorithms for non-commitment randomness
     pub seed: [u8; 32],
+    /// Hidden commitment seed (s_0) used for RT price/commitment chain
+    #[serde(skip)]
+    hidden_seed: [u8; 32],
     /// Difficulty parameters
     pub difficulty: Level2Difficulty,
     /// Network topology and parameters
@@ -749,6 +752,8 @@ impl Level2Challenge {
         difficulty: &Level2Difficulty,
     ) -> Result<Self> {
         let mut rng = SmallRng::from_seed(StdRng::from_seed(*seed).gen());
+        let pub_seed: [u8; 32] = rng.gen();
+        let priv_seed: [u8; 32] = rng.gen();
         let params = difficulty.effective_params();
 
         let n = params.num_nodes;
@@ -782,7 +787,8 @@ impl Level2Challenge {
         };
 
         Ok(Level2Challenge {
-            seed: *seed,
+            seed: pub_seed,
+            hidden_seed: priv_seed,
             difficulty: difficulty.clone(),
             network,
             batteries,
@@ -794,19 +800,59 @@ impl Level2Challenge {
     }
 
     /// Build the initial simulation state at t=0.
-    /// Uses the challenge seed with all-false congestion indicators (spec: 1^cong_{i,0} = 0).
+    /// Uses the hidden commitment seed with all-false congestion indicators
+    /// (spec: 1^cong_{i,0} = 0).
     pub fn initial_state(&self) -> State {
         let socs: Vec<f64> = self.batteries
             .iter()
             .map(|b| b.spec.soc_initial_mwh)
             .collect();
         let congestion_indicators = vec![false; self.network.num_nodes];
-        let rt_prices = self.generate_rt_prices(0, &self.seed, &congestion_indicators);
+        let rt_prices = self.generate_rt_prices(0, &self.hidden_seed, &congestion_indicators);
         State {
             time_step: 0,
             socs,
             rt_prices,
         }
+    }
+
+    /// Return feasible signed action bounds `(u_min, u_max)` for one battery.
+    ///
+    /// Bounds are computed from:
+    /// 1. Nameplate charge/discharge power limits
+    /// 2. SOC headroom/availability for the given `soc_mwh`
+    ///
+    /// Sign convention:
+    /// - `u < 0`: charge
+    /// - `u > 0`: discharge
+    ///
+    /// This helper does not account for network flow coupling across batteries.
+    pub fn battery_action_bounds(&self, battery_idx: usize, soc_mwh: f64) -> (f64, f64) {
+        let battery = &self.batteries[battery_idx].spec;
+        let dt = constants::DELTA_T;
+
+        let headroom = (battery.soc_max_mwh - soc_mwh).max(0.0);
+        let available = (soc_mwh - battery.soc_min_mwh).max(0.0);
+
+        let max_charge_from_soc = if battery.efficiency_charge > 0.0 {
+            headroom / (battery.efficiency_charge * dt)
+        } else {
+            0.0
+        };
+        let max_discharge_from_soc = if battery.efficiency_discharge > 0.0 {
+            available * battery.efficiency_discharge / dt
+        } else {
+            0.0
+        };
+
+        let max_charge = max_charge_from_soc
+            .min(battery.power_charge_mw)
+            .max(0.0);
+        let max_discharge = max_discharge_from_soc
+            .min(battery.power_discharge_mw)
+            .max(0.0);
+
+        (-max_charge, max_discharge)
     }
 
     /// Validate a portfolio action against all constraints and return new SOCs on success.
@@ -918,7 +964,7 @@ impl Level2Challenge {
         let h = params.num_steps;
 
         let mut state = self.initial_state();
-        let mut seed = self.seed;
+        let mut seed = self.hidden_seed;
         let mut congestion_indicators = vec![false; self.network.num_nodes];
         let mut schedule = Vec::with_capacity(h);
 
@@ -1298,7 +1344,7 @@ impl Level2Challenge {
         }
 
         let mut state = self.initial_state();
-        let mut seed = self.seed;
+        let mut seed = self.hidden_seed;
         let mut congestion_indicators = vec![false; self.network.num_nodes];
         let mut total_profit = 0.0;
 

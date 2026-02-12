@@ -8,10 +8,10 @@
  * Updated for spec-compliant API with SignedAction and Track system.
  */
 
-use anyhow::Result;
 use crate::energy_arbitrage_v2::{
     constants, Level2Challenge, Level2Solution, PortfolioAction, SignedAction,
 };
+use anyhow::Result;
 
 /// Configuration for Level 2 greedy solver
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ pub fn solve_with_config(
             let limit = challenge.network.flow_limits[l] * config.flow_safety_margin;
             // (negative_room, positive_room) - how much more flow we can add in each direction
             let neg_room = limit - (-flow).max(0.0); // Room for more negative flow
-            let pos_room = limit - flow.max(0.0);     // Room for more positive flow
+            let pos_room = limit - flow.max(0.0); // Room for more positive flow
             flow_headroom.push((neg_room.max(0.0), pos_room.max(0.0)));
         }
 
@@ -125,9 +125,8 @@ pub fn solve_with_config(
         }
 
         // Iteratively adjust actions to satisfy flow constraints
-        let portfolio_action = iterative_flow_adjustment(
-            challenge, step, &candidate_actions, &socs, config
-        );
+        let portfolio_action =
+            iterative_flow_adjustment(challenge, step, &candidate_actions, &socs, config);
 
         // Update SOCs
         for (b, placed) in challenge.batteries.iter().enumerate() {
@@ -163,7 +162,9 @@ fn iterative_flow_adjustment(
     let mut actions = candidate_actions.to_vec();
 
     for _iter in 0..config.max_flow_iterations {
-        let portfolio = PortfolioAction { actions: actions.clone() };
+        let portfolio = PortfolioAction {
+            actions: actions.clone(),
+        };
         let injections = challenge.compute_total_injections(&portfolio, time_step);
         let flows = challenge.network.compute_flows(&injections);
 
@@ -242,7 +243,9 @@ fn iterative_flow_adjustment(
     }
 
     // Final verification pass - if still violated, scale down aggressively
-    let portfolio = PortfolioAction { actions: actions.clone() };
+    let portfolio = PortfolioAction {
+        actions: actions.clone(),
+    };
     let injections = challenge.compute_total_injections(&portfolio, time_step);
     let flows = challenge.network.compute_flows(&injections);
 
@@ -266,11 +269,15 @@ fn iterative_flow_adjustment(
                 .iter()
                 .map(|a| SignedAction::new(a.power_mw * mid))
                 .collect();
-            let scaled_portfolio = PortfolioAction { actions: scaled_actions };
+            let scaled_portfolio = PortfolioAction {
+                actions: scaled_actions,
+            };
             let inj = challenge.compute_total_injections(&scaled_portfolio, time_step);
             let fl = challenge.network.compute_flows(&inj);
 
-            let feasible = fl.iter().zip(challenge.network.flow_limits.iter())
+            let feasible = fl
+                .iter()
+                .zip(challenge.network.flow_limits.iter())
                 .all(|(&f, &lim)| f.abs() <= lim + constants::EPS_FLOW);
 
             if feasible {
@@ -298,7 +305,8 @@ mod tests {
     fn test_level2_greedy_track1() {
         let difficulty = Level2Difficulty::from_track(Track::Track1);
         let seed = [42u8; 32];
-        let challenge = Level2Challenge::generate_instance_with_difficulty(&seed, &difficulty).unwrap();
+        let challenge =
+            Level2Challenge::generate_instance_with_difficulty(&seed, &difficulty).unwrap();
 
         let solution = solve_challenge(&challenge).unwrap().unwrap();
         assert_eq!(solution.schedule.len(), 96); // Track 1 has 96 steps
@@ -316,7 +324,8 @@ mod tests {
             let difficulty = Level2Difficulty::from_track(track);
             let seed = [123u8; 32];
 
-            let challenge = Level2Challenge::generate_instance_with_difficulty(&seed, &difficulty).unwrap();
+            let challenge =
+                Level2Challenge::generate_instance_with_difficulty(&seed, &difficulty).unwrap();
             let params = difficulty.effective_params();
 
             let solution = solve_challenge(&challenge).unwrap().unwrap();
