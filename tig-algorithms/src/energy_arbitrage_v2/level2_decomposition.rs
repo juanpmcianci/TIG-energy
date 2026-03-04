@@ -13,6 +13,7 @@ use anyhow::Result;
 use tig_challenges::energy_arbitrage_v2::{
     constants, Level2Challenge, Level2Solution, PortfolioAction, SignedAction,
 };
+use super::level2_greedy;
 
 /// Configuration for decomposition solver
 #[derive(Debug, Clone)]
@@ -30,7 +31,7 @@ impl Default for DecompositionConfig {
         Self {
             max_iterations: 30,
             tolerance: 1e-4,
-            flow_margin: 0.95,
+            flow_margin: 0.98,
         }
     }
 }
@@ -48,8 +49,13 @@ pub fn solve_with_config(
     let params = challenge.difficulty.effective_params();
     let t = params.num_steps;
 
-    // Initialize with conservative greedy solution
-    let mut schedule = initial_schedule(challenge, config);
+    // Initialize from greedy solution (ensures decomp ≥ greedy)
+    let greedy_schedule = match level2_greedy::solve_challenge(challenge)? {
+        Some(greedy_sol) => Some(greedy_sol.schedule),
+        None => None,
+    };
+    let mut schedule = greedy_schedule.clone()
+        .unwrap_or_else(|| initial_schedule(challenge, config));
 
     // Iterative refinement
     for _iter in 0..config.max_iterations {
@@ -76,7 +82,29 @@ pub fn solve_with_config(
     // Final feasibility enforcement
     schedule = enforce_all_constraints(challenge, schedule, config);
 
-    Ok(Some(Level2Solution { schedule }))
+    // Return the better of decomp result and greedy input
+    if let Some(greedy_sched) = greedy_schedule {
+        let decomp_sol = Level2Solution { schedule };
+        let greedy_sol = Level2Solution { schedule: greedy_sched };
+
+        let decomp_ok = challenge.verify_solution(&decomp_sol).ok();
+        let greedy_ok = challenge.verify_solution(&greedy_sol).ok();
+
+        match (decomp_ok, greedy_ok) {
+            (Some(dp), Some(gp)) => {
+                if dp >= gp {
+                    Ok(Some(decomp_sol))
+                } else {
+                    Ok(Some(greedy_sol))
+                }
+            }
+            (Some(_), None) => Ok(Some(decomp_sol)),
+            (None, Some(_)) => Ok(Some(greedy_sol)),
+            (None, None) => Ok(Some(decomp_sol)),
+        }
+    } else {
+        Ok(Some(Level2Solution { schedule }))
+    }
 }
 
 /// Generate initial schedule - conservative to ensure feasibility

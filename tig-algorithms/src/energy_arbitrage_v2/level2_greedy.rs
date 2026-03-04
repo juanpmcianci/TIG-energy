@@ -29,9 +29,9 @@ pub struct GreedyConfig {
 impl Default for GreedyConfig {
     fn default() -> Self {
         Self {
-            charge_threshold: 0.95,
-            discharge_threshold: 1.05,
-            flow_safety_margin: 0.85,
+            charge_threshold: 0.93,
+            discharge_threshold: 1.07,
+            flow_safety_margin: 0.98,
             max_flow_iterations: 20,
         }
     }
@@ -100,18 +100,19 @@ pub fn solve_with_config(
                 .min(battery.power_discharge_mw)
                 .max(0.0);
 
-            // Simple greedy decision based on price
-            let avg_price = average_da_price(challenge, step);
+            // Compare to this node's temporal average (captures temporal arbitrage)
+            let node_avg_price = challenge.day_ahead_prices[node].iter().sum::<f64>()
+                / challenge.day_ahead_prices[node].len() as f64;
 
-            let action = if da_price < config.charge_threshold * avg_price {
-                // Low price - want to charge (negative u)
+            let action = if da_price < config.charge_threshold * node_avg_price {
+                // Low price relative to this node's average → charge
                 if max_charge > 0.1 {
                     SignedAction::new(-max_charge)
                 } else {
                     SignedAction::idle()
                 }
-            } else if da_price > config.discharge_threshold * avg_price {
-                // High price - want to discharge (positive u)
+            } else if da_price > config.discharge_threshold * node_avg_price {
+                // High price relative to this node's average → discharge
                 if max_discharge > 0.1 {
                     SignedAction::new(max_discharge)
                 } else {

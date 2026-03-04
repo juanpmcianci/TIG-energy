@@ -74,7 +74,7 @@ pub mod constants {
     pub const GAMMA_PRICE: f64 = 20.0;
 
     /// Congestion proximity threshold
-    pub const TAU_CONG: f64 = 0.97;
+    pub const TAU_CONG: f64 = 0.90;
 
     /// Jump probability
     pub const RHO_JUMP: f64 = 0.02;
@@ -104,7 +104,11 @@ pub mod constants {
     pub const NOMINAL_POWER: f64 = 25.0;
 
     /// Nominal line flow limit (MW)
-    pub const NOMINAL_FLOW_LIMIT: f64 = 100.0;
+    /// With per-timestep rescaling and flow_margin=0.85, exo flows reach ~85%
+    /// on the binding line per timestep. Battery power ~25 MW with PTDF~0.05-0.15
+    /// adds ~1-4 MW per line. F_base=50 gives effective limits 20-50 MW,
+    /// so battery action is ~2-20% of limit per line.
+    pub const NOMINAL_FLOW_LIMIT: f64 = 50.0;
 
     /// Base susceptance for network generation
     pub const BASE_SUSCEPTANCE: f64 = 10.0;
@@ -1119,9 +1123,13 @@ impl Level2Challenge {
             .collect();
 
         // Combine with noise
-        let base_load = 50.0; // MW
-        let pattern_scale = 20.0;
-        let noise_scale = 2.0;
+        // p_base must be large enough that raw exo flows routinely exceed
+        // flow_margin * effective_limit, so the rescaling step activates and
+        // brings utilization up to ~flow_margin. With F_base=100 and typical
+        // PTDF values, p_base=200 ensures the rescaling binds for most seeds.
+        let base_load = 200.0; // MW (was 50)
+        let pattern_scale = 60.0; // (was 20)
+        let noise_scale = 5.0; // (was 2)
 
         for i in 0..num_nodes {
             if i == network.slack_bus {
@@ -1148,30 +1156,27 @@ impl Level2Challenge {
             injections[network.slack_bus][t] = -sum;
         }
 
-        // Verify flows are within EFFECTIVE limits (after gamma_cong scaling)
-        // Use a margin to leave room for battery actions
-        let flow_margin = 0.7; // Use only 70% of limit for exogenous flows
-        let mut scale: f64 = 1.0;
+        // Per-timestep rescaling: ensure exogenous flows stay within
+        // flow_margin * effective_limit for each timestep independently.
+        // This avoids the "one-bad-timestep-kills-all" problem of global scaling.
+        let flow_margin = 0.85;
         for t in 0..num_steps {
             let inj: Vec<f64> = injections.iter().map(|v| v[t]).collect();
             let flows = network.compute_flows(&inj);
+            let mut scale_t: f64 = 1.0;
             for (l, &flow) in flows.iter().enumerate() {
-                // Use effective flow_limits, not nominal, and leave margin
                 let limit = network.flow_limits[l] * flow_margin;
                 if flow.abs() > limit {
-                    scale = scale.min(limit / flow.abs() * 0.95);
+                    scale_t = scale_t.min(limit / flow.abs());
                 }
             }
-        }
-
-        if scale < 1.0 {
-            for i in 0..num_nodes {
-                for t in 0..num_steps {
-                    injections[i][t] *= scale;
+            if scale_t < 1.0 {
+                for i in 0..num_nodes {
+                    if i != network.slack_bus {
+                        injections[i][t] *= scale_t;
+                    }
                 }
-            }
-            // Re-balance at slack
-            for t in 0..num_steps {
+                // Re-balance at slack
                 let mut sum = 0.0;
                 for i in 0..num_nodes {
                     if i != network.slack_bus {
